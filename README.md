@@ -79,7 +79,7 @@ Versioning is `v0.01`, `v0.02`, … for debug builds; a build only moves forward
 
 | Build | Date | Driver | Termux `vulkaninfo` | Winlator | ARMSX2 | Notes |
 |---|---|---|---|---|---|---|
-| v0.01 | 2026-10-21 | Mesa 26.3.0-devel + kbase JM | **PASS** (L0 + L1 + offscreen) | **swapchain PASS**, game pending | package built, import pending | First device build; see test log |
+| v0.01 | 2026-10-21 | Mesa 26.3.0-devel + kbase JM | **PASS** (L0 + L1 + offscreen) | **swapchain PASS**, DXVK map failure | **PASS** — Kingdom Hearts native + 2x | First device build; see test log |
 
 ### v0.01 device validation
 
@@ -92,11 +92,15 @@ Run on the A51, Android 16 / kbase r38p1, Termux loader 1.4.365:
 | Compute submission | **PASS** | 64 invocations, readback `1 3 5 7 9 11 13 15 …`, exact match |
 | Offscreen graphics | **PASS** | full-screen triangle, 65,536 red pixels, centre `255,0,0,255` |
 | Android swapchain (Winlator) | **PASS** | Winlator compositor created a 1080×2400 swapchain on `Mali-G72 MC3` |
-| DXVK game | pending | NFS process exited after ~13 s without a captured DXVK error |
+| DXVK game | pending | NFS process exits on `vkMapMemory`/`OUT_OF_HOST_MEMORY`; see Winlator repo |
+| ARMSX2 gameplay | **PASS** | Kingdom Hearts (USA): 33–45 FPS OSD / 65–88 FPS PerfLog at native, 30 FPS at 2x |
 
 The complete log is in [`docs/TEST-RESULTS.md`](docs/TEST-RESULTS.md). The Winlator/DXVK result is
 deliberately **not** marked as working: a loaded driver and a created swapchain are not the same as
-a rendered game.
+a rendered game. ARMSX2 is the first application-level pass; the GPU-heavy scene and 2x upscale
+both rendered correctly. See the
+[ARMSX2 repository](https://github.com/soulexit/panvk-exynos9611-kbase-armsx2) for the package and
+full test log.
 
 ### What should work (inherited from the base tree)
 

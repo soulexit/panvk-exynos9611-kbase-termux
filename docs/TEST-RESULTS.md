@@ -18,7 +18,7 @@ but has not been validated on the device.
 
 | Version | Date | Driver | L0 enumerate | L1 offscreen | L2 WSI | L3 app | Notes |
 |---|---|---|---|---|---|---|---|
-| v0.01 | 2026-10-21 | Mesa 26.3.0-devel, base `fb3b49d`, kbase JM | **PASS** | **PASS** (compute + triangle) | **PASS** (Winlator compositor) | pending (NFS/DXVK) | first debug build |
+| v0.01 | 2026-10-21 | Mesa 26.3.0-devel, base `fb3b49d`, kbase JM | **PASS** | **PASS** (compute + triangle) | **PASS** (Winlator compositor) | **PASS** (ARMSX2/Kingdom Hearts); Winlator DXVK pending | first debug build |
 
 ### v0.01 details
 
@@ -49,7 +49,27 @@ vertex/tiler/fragment path, not only compute.
 (`vendorID=0x13b5`, `driverVersion=0x6802063`, `apiVersion=1.3.358`). The DXVK/NFS process exited
 after about 13 seconds and no DXVK error was captured, so the game result is **inconclusive**.
 
-**L3 — application:** pending. See the Winlator repository for the game test.
+**L3 — application:** **PASS** in ARMSX2. The driver was imported through ARMSX2's
+**Settings → Renderer → Graphics API → Vulkan → GPU Driver → Import** path and selected as
+**PanVK Exynos 9611 (Mali-G72 MP3)**. Kingdom Hearts (USA, `SLUS-20370`, CRC `0F6B6315`) booted to
+the Destiny Islands scene and rendered correctly:
+
+```text
+VK: GPU 'Mali-G72 MC3' vendor=0x13B5 driver='panvk'
+    (Mesa 26.3.0-devel (git-fb3b49d016))
+```
+
+- Native (`512x447`), frame limit off: 33–45 FPS in the OSD, 65–88 FPS in the 30-second `PerfLog`;
+  EE 100%, GS 67–86%, VU 37–45%.
+- 2x (`1024x894`), 30 FPS cap: 29.97 FPS / 98–100% speed; EE 79–89%, GS 62–70%, VU 28–32%.
+- No visible corruption and no GPU reset during either run.
+- ARMSX2 reports `GPU 0.0% / 0.00 ms` with PanVK, so GPU utilization is not measurable from its
+  overlay.
+
+Winlator/DXVK is still pending: the compositor creates a swapchain, but DXVK fails at
+`vkMapMemory` with `VK_ERROR_OUT_OF_HOST_MEMORY`. See the Winlator repository for that log.
+The full ARMSX2 evidence is in the
+[ARMSX2 repository](https://github.com/soulexit/panvk-exynos9611-kbase-armsx2/blob/main/docs/TEST-RESULTS.md).
 
 ## Raw evidence
 
