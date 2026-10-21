@@ -350,6 +350,10 @@ truth: do not claim a build works on a configuration that is not listed there.
   research and packaging references.
 - Everyone who tested an experimental Mali Vulkan driver and sent logs.
 
+## Development assistance
+
+Made with help from **DeepSeek** and **OpenCode**.
+
 ## License
 
 The build scripts, documentation and local patches in this repository are MIT licensed. Mesa and
