@@ -18,7 +18,7 @@ Mesa's license text is in `LICENSES/` of the Mesa source tree.
 The pinned base tree:
 
 - Project: https://github.com/JimVulkan/mali-panvk
-- Commit: `fb3b49d016544c19d83e558462f2d29470e77c28`
+- Commit: `d896b0a9c10b92f0f9d53ef3373006b79ed709e8`
 - License: MIT for the changes; Mesa per-file licenses for Mesa files
 
 It provides the Bifrost kbase Job Manager backend, the 64-byte `base_jd_atom` layout, the

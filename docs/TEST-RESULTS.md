@@ -18,7 +18,46 @@ but has not been validated on the device.
 
 | Version | Date | Driver | L0 enumerate | L1 offscreen | L2 WSI | L3 app | Notes |
 |---|---|---|---|---|---|---|---|
+| v0.02 | 2026-10-26 | Mesa 27.0.0-devel, base `d896b0a` + 2 patches, kbase JM | **PASS** | **PASS** (compute + triangle) | **PASS** (Winlator, Eden, ARMSX2) | **PASS** ARMSX2/Kingdom Hearts; **PASS** Winlator DXVK D3D9 (NFS MW intro + title); Eden title/menus only | new base, Eden + DXVK fixes |
 | v0.01 | 2026-10-21 | Mesa 26.3.0-devel, base `fb3b49d`, kbase JM | **PASS** | **PASS** (compute + triangle) | **PASS** (Winlator compositor) | **PASS** (ARMSX2/Kingdom Hearts); Winlator DXVK pending | first debug build |
+
+### v0.02 details
+
+**L0:** `deviceName = Mali-G72 MC3`, `apiVersion = 1.3.363`,
+`driverInfo = Mesa 27.0.0-devel (git-18275303ac)` (patched tree). New versus v0.01:
+`textureCompressionBC`, `VK_KHR_maintenance10/11`, `VK_EXT_image_compression_control`,
+`VK_KHR_shader_constant_data`, `VK_INTEL_shader_integer_functions2`.
+
+**L1:** compute readback and the offscreen triangle pass, unchanged.
+
+**ARMSX2 — Kingdom Hearts (USA), same save state as v0.01** (Destiny Islands, facing the shack):
+
+| Driver | Uncapped native | 30 FPS cap, native | 30 FPS cap, 2x (1024×894) |
+|---|---|---|---|
+| v0.01 | 33–45 FPS, EE 100% | 29.7–30.0 FPS, GS 9.7–12.8 ms | 26–30 FPS |
+| v0.02 | 30–46 FPS, EE 100% | 29.5–30.0 FPS, GS 9.7–10.9 ms | 27–30 FPS |
+
+The game is limited by EE (CPU emulation) on this SoC; the two drivers are at parity and v0.02
+showed no GPU fault in either run.
+
+**Winlator — Need for Speed: Most Wanted Black Edition** (container 1, FEXCore, DXVK-Sarek 1.11.0,
+`D3D9`, 1280×720): the intro video, logo, title screen ("CLICK to continue") and attract video
+render correctly at 50–60 FPS on `Wrapper(Mali-G72 MC3)` with **no GPU fault in `dmesg`**. With
+v0.01 the same game exited after ~13 s. Menu navigation from adb did not register as clicks, so
+in-race gameplay is not verified yet. DmC: Devil May Cry (D3D11) exits inside Wine before DXVK
+initialises (no DXVK log), so D3D11 is untested.
+
+**Eden — The Legend of Zelda: Echoes of Wisdom (v1.1.0):**
+
+| Driver | Result |
+|---|---|
+| v0.01 | black screen, `0x58`/`0x5b` GPU faults, no HUD |
+| base `d896b0a` unpatched | SIGSEGV in `vkCmdClearAttachments` after ~200 submissions; `0x51` faults |
+| v0.02 | title screen and file-select menus render at 56–60 FPS, **no GPU fault** |
+
+Loading a save still hits GPU translation faults (`JOB_READ_FAULT`) and a black screen; this is
+the next item. Eden's *GPU unswizzle* option produced block corruption on the title screen and must
+be off. Eden's own BC handling works with `PANVK_NO_BC_EMU=1` as well.
 
 ### v0.01 details
 

@@ -27,6 +27,38 @@ Run `scripts/collect-logs.sh` to bundle all of it.
 | `MESA_LOG=stderr` | Mesa logs to stderr instead of logcat |
 | `MESA_SHADER_CACHE_DISABLE=1` | Disable the on-disk shader cache |
 | `MESA_SHADER_CACHE_DIR=/tmp/panvk-cache` | Use a writable cache directory |
+| `PANVK_NO_BC_EMU=1` | Turn off BCn emulation (the app decodes BC itself, if it can) |
+| `PANVK_FORCE_ROBUST=1` | Bounds-check every UBO/SSBO access (v0.02+) |
+| `PANVK_VALIDATE=1` | Check every descriptor address of a job against the live BOs before it is submitted; record BO frees; on the first failed submission write `fault-<pid>.txt` (memory map + free history) next to the driver (v0.02+) |
+| `PANVK_KBASE_GROW_COMMIT_MB=<n>` | Commit `n` MB of the grow-on-fault heaps up front (v0.02+) |
+
+### Setting switches inside an app: `panvk.env` (v0.02+)
+
+Winlator, ARMSX2 and Eden load the driver from their own data directory and give no way to set
+environment variables. Put a file named `panvk.env` next to the driver `.so` with one `KEY=VALUE`
+per line (`#` starts a comment). It is read at instance creation; variables already set in the
+environment win, and each applied line is logged (`panvk: KEY=VALUE (from …)`). As root:
+
+```sh
+D=/data/data/dev.eden.eden_emulator.nightly/files/gpu_driver      # Eden
+# D=/data/data/com.armsx2.nightly/files/drivers/<driver-id>       # ARMSX2
+# D=/data/data/com.winlator.cmod/files/contents/adrenotools/<name> # Winlator
+echo PANVK_VALIDATE=1 > $D/panvk.env
+chown $(stat -c %u:%g $D) $D/panvk.env && chcon $(stat -c %C $D) $D/panvk.env
+```
+
+### Reading a GPU fault (v0.02+)
+
+When a kbase submission fails, the driver logs (`logcat -s MESA`):
+
+- `kbase: atom N finished with event code C` for every failed atom. Only the **first** failure
+  matters; kbase fails the dependent atoms with the same or a `TERMINATED` (4) code.
+  Codes: `0x51` (81) invalid instruction encoding, `0x58` (88) invalid descriptor data,
+  `0x42` (66) job read fault (an MMU fault, see `dmesg` for the VA).
+- `panvk: batch B job J: status S type T … fault F` for every job of the submission. The job with
+  `status` other than 0 (never ran) or 1 (done) is the one that faulted; its header, payload
+  pointers and the memory at `fault` follow (`job @…`, `ptr @…`, `fault @…`). On kbase the GPU
+  address equals the CPU address of the BO, so these are read in-process.
 
 `PANVK_DEBUG` values are checked in the driver source; an unknown value is ignored.
 

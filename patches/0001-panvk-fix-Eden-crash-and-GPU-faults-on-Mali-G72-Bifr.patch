@@ -1,0 +1,326 @@
+From 18275303acb2eabcb969b2cef260b82723540915 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 17:04:32 +0300
+Subject: [PATCH 1/2] panvk: fix Eden crash and GPU faults on Mali-G72 (Bifrost
+ v6)
+
+- Size push descriptor storage for combined image samplers, which take
+  textures_per_desc + samplers_per_desc slots each. maxPushDescriptors (32)
+  combined samplers overflowed the 32-slot push set and the meta save
+  buffer (SIGSEGV in meta_gfx_end from vkCmdClearAttachments).
+- Give the Bifrost null texture its own table of 256 surfaces that read the
+  zero buffer. Sampling a null binding as an array/cube indexed past the
+  single surface of the 1x1 view and faulted (DATA_INVALID_FAULT 0x58).
+- Read KEY=VALUE lines from panvk.env next to the driver, for loaders that
+  give no way to set environment variables.
+- Dump the faulting job, its payload pointers and the memory around the
+  fault address when a kbase submission fails.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c   | 55 +++++++++++++++
+ src/panfrost/vulkan/panvk_cmd_desc_state.h    |  2 +-
+ src/panfrost/vulkan/panvk_cmd_meta.h          |  4 +-
+ .../vulkan/panvk_descriptor_set_layout.h      |  4 ++
+ src/panfrost/vulkan/panvk_device.h            |  2 +
+ src/panfrost/vulkan/panvk_instance.c          | 42 +++++++++++
+ src/panfrost/vulkan/panvk_vX_device.c         | 69 +++++++++++++++++++
+ 7 files changed, 175 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 9a3c4d1..c459f3d 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -29,6 +29,9 @@
+ #include "vk_drm_syncobj.h"
+ #include "vk_framebuffer.h"
+ 
++#include <stdio.h>
++#include <unistd.h>
++
+ #include "kmod/pan_kmod.h"
+ 
+ #include "drm-uapi/panfrost_drm.h"
+@@ -76,6 +79,46 @@ panvk_queue_prepare_batch(struct panvk_device *dev, struct panvk_cmd_buffer *cmd
+  * job header's exception status (word 0) and fault pointer (words 2-3) back when the job ends,
+  * and leaves 0 in the ones it never ran -- that is how the TLS overrun on the Mali-G52 was found
+  * (the first job after the last DONE one was the spilling kernel). */
++/* Read GPU memory through its CPU mapping (kbase maps BOs at the same VA on
++ * both sides), without faulting if the address is not mapped. */
++static bool
++panvk_peek(uint64_t va, void *dst, size_t size)
++{
++   FILE *f = fopen("/proc/self/maps", "r");
++   if (!f)
++      return false;
++   char line[512];
++   bool ok = false;
++   while (fgets(line, sizeof(line), f)) {
++      unsigned long long lo, hi;
++      char perms[5];
++      if (sscanf(line, "%llx-%llx %4s", &lo, &hi, perms) == 3 && va >= lo &&
++          va + size <= hi && perms[0] == 'r') {
++         ok = true;
++         break;
++      }
++   }
++   fclose(f);
++   if (ok)
++      memcpy(dst, (const void *)(uintptr_t)va, size);
++   return ok;
++}
++
++static void
++panvk_dump_words(const char *what, uint64_t va, unsigned count)
++{
++   uint32_t w[64];
++   count = MIN2(count, ARRAY_SIZE(w));
++   if (!va || !panvk_peek(va, w, count * 4)) {
++      mesa_loge("panvk:   %s @0x%" PRIx64 ": unreadable", what, va);
++      return;
++   }
++   for (unsigned i = 0; i < count; i += 8)
++      mesa_loge("panvk:   %s @0x%" PRIx64 "+0x%02x: %08x %08x %08x %08x %08x %08x %08x %08x",
++                what, va, i * 4, w[i], w[i + 1], w[i + 2], w[i + 3], w[i + 4], w[i + 5],
++                w[i + 6], w[i + 7]);
++}
++
+ static void
+ panvk_kbase_report_faults(struct panvk_device *dev, struct panvk_cmd_buffer *const *cmdbufs,
+                           unsigned nr_cmdbufs)
+@@ -90,6 +133,18 @@ panvk_kbase_report_faults(struct panvk_device *dev, struct panvk_cmd_buffer *con
+             mesa_loge("panvk: batch %u job %u: status 0x%x type %u index %u deps %u,%u "
+                       "fault 0x%" PRIx64, b, k, w[0], (w[4] >> 1) & 0x7f, w[4] >> 16,
+                       w[5] & 0xffff, w[5] >> 16, (uint64_t)w[2] | ((uint64_t)w[3] << 32));
++            if (w[0] > 1) {
++               uint64_t fault = (uint64_t)w[2] | ((uint64_t)w[3] << 32);
++               panvk_dump_words("job", (uint64_t)(uintptr_t)*job, 64);
++               panvk_dump_words("fault", (fault & ~0xffull) - 0x40, 64);
++               panvk_dump_words("fault+", (fault & ~0xffull) + 0xc0, 64);
++               /* Pointers in the job payload, to see what the fault address belongs to. */
++               for (unsigned i = 8; i < 62; i += 2) {
++                  uint64_t ptr = ((uint64_t)w[i] | ((uint64_t)w[i + 1] << 32)) & ~0x3full;
++                  if (ptr >> 32 && ptr >> 48 == 0)
++                     panvk_dump_words("ptr", ptr, 48);
++               }
++            }
+             k++;
+          }
+          b++;
+diff --git a/src/panfrost/vulkan/panvk_cmd_desc_state.h b/src/panfrost/vulkan/panvk_cmd_desc_state.h
+index 3bde62f..d479bb9 100644
+--- a/src/panfrost/vulkan/panvk_cmd_desc_state.h
++++ b/src/panfrost/vulkan/panvk_cmd_desc_state.h
+@@ -58,7 +58,7 @@ panvk_shader_res_table_count(struct panvk_shader_desc_state *shader_desc_state)
+ struct panvk_push_set {
+    struct panvk_cmd_pool_obj base;
+    struct panvk_descriptor_set set;
+-   struct panvk_opaque_desc descs[MAX_PUSH_DESCS];
++   struct panvk_opaque_desc descs[MAX_PUSH_DESC_SLOTS];
+ };
+ 
+ struct panvk_descriptor_state {
+diff --git a/src/panfrost/vulkan/panvk_cmd_meta.h b/src/panfrost/vulkan/panvk_cmd_meta.h
+index a896f7d..94f301a 100644
+--- a/src/panfrost/vulkan/panvk_cmd_meta.h
++++ b/src/panfrost/vulkan/panvk_cmd_meta.h
+@@ -24,7 +24,7 @@ struct panvk_cmd_meta_compute_save_ctx {
+    } cs;
+    const struct panvk_descriptor_set *set0;
+    struct {
+-      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS];
++      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESC_SLOTS];
+       uint64_t descs_dev_addr;
+       uint32_t desc_count;
+       bool dirty;
+@@ -38,7 +38,7 @@ struct panvk_cmd_meta_graphics_save_ctx {
+    const struct panvk_graphics_pipeline *pipeline;
+    const struct panvk_descriptor_set *set0;
+    struct {
+-      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS];
++      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESC_SLOTS];
+       uint64_t descs_dev_addr;
+       uint32_t desc_count;
+       bool dirty;
+diff --git a/src/panfrost/vulkan/panvk_descriptor_set_layout.h b/src/panfrost/vulkan/panvk_descriptor_set_layout.h
+index 603a4c6..f27f2d6 100644
+--- a/src/panfrost/vulkan/panvk_descriptor_set_layout.h
++++ b/src/panfrost/vulkan/panvk_descriptor_set_layout.h
+@@ -23,6 +23,10 @@
+ #define MAX_DYNAMIC_UNIFORM_BUFFERS   16
+ #define MAX_DYNAMIC_STORAGE_BUFFERS   8
+ #define MAX_PUSH_DESCS                32
++/* A combined image sampler takes one slot per texture plane and per sampler
++ * descriptor (PANVK_MAX_PLANES + PANVK_MAX_DESCS_PER_SAMPLER), so push sets
++ * need room for more slots than maxPushDescriptors. */
++#define MAX_PUSH_DESC_SLOTS           (MAX_PUSH_DESCS * (3 + 2))
+ #define MAX_INLINE_UNIFORM_BLOCK_SIZE (1 << 16)
+ #define MAX_DYNAMIC_BUFFERS                                                    \
+    (MAX_DYNAMIC_UNIFORM_BUFFERS + MAX_DYNAMIC_STORAGE_BUFFERS)
+diff --git a/src/panfrost/vulkan/panvk_device.h b/src/panfrost/vulkan/panvk_device.h
+index 85060fe..8acf7b7 100644
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -95,6 +95,8 @@ struct panvk_device {
+       VkImageView view;
+       VkBuffer buffer;
+       VkDeviceMemory buffer_mem;
++      VkBuffer surf_buffer;
++      VkDeviceMemory surf_mem;
+    } null_descs;
+ 
+    struct {
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index e711743..46cfe47 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -10,6 +10,11 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <dlfcn.h>
++#include <libgen.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <sys/stat.h>
+ 
+ #include "util/build_id.h"
+@@ -61,9 +66,46 @@ static const struct debug_control panvk_debug_options[] = {
+ 
+ uint64_t panvk_debug;
+ 
++/* Apps that load the driver from their own data directory (AdrenoTools-style
++ * loaders in Winlator, ARMSX2, Eden) give no way to set environment variables.
++ * Read KEY=VALUE lines from panvk.env next to the driver instead; variables
++ * already in the environment win. */
++static void
++panvk_load_env_file(void)
++{
++   Dl_info info;
++   if (!dladdr((void *)panvk_load_env_file, &info) || !info.dli_fname)
++      return;
++
++   char path[4096];
++   snprintf(path, sizeof(path), "%s", info.dli_fname);
++   char *dir = dirname(path);
++   char file[4096];
++   snprintf(file, sizeof(file), "%s/panvk.env", dir);
++
++   FILE *f = fopen(file, "r");
++   if (!f)
++      return;
++
++   char line[1024];
++   while (fgets(line, sizeof(line), f)) {
++      line[strcspn(line, "\r\n")] = 0;
++      if (line[0] == '#' || !line[0])
++         continue;
++      char *eq = strchr(line, '=');
++      if (!eq || eq == line)
++         continue;
++      *eq = 0;
++      setenv(line, eq + 1, 0);
++      mesa_logi("panvk: %s=%s (from %s)", line, getenv(line), file);
++   }
++   fclose(f);
++}
++
+ static void
+ panvk_debug_init_once(void)
+ {
++   panvk_load_env_file();
+    panvk_debug =
+       parse_debug_string(os_get_option("PANVK_DEBUG"), panvk_debug_options);
+ }
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index da0748c..0d59815 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -560,6 +560,71 @@ panvk_init_null_descs(struct panvk_device *dev)
+    GENX(pan_buffer_texture_emit)(&bview, &texel.buf, &texel.attr);
+    memcpy(dev->null_descs.texel, &texel, sizeof(texel));
+ 
++   /* The view's texture has one surface, but a shader that samples a null
++    * binding as an array or cube still indexes surfaces by layer, face and
++    * level, and the GPU reads whatever follows the single entry as a surface
++    * pointer (DATA_INVALID_FAULT). Point the null texture at a table of
++    * surfaces that all read the zero buffer instead. */
++   const unsigned nr_surfs = 256;
++   const VkBufferCreateInfo sbci = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = nr_surfs * pan_size(SURFACE_WITH_STRIDE),
++      .usage = VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT,
++   };
++   result = t->CreateBuffer(h, &sbci, NULL, &dev->null_descs.surf_buffer);
++   if (result != VK_SUCCESS)
++      return result;
++   t->GetBufferMemoryRequirements(h, dev->null_descs.surf_buffer, &mr);
++
++   const struct panvk_physical_device *pdev =
++      to_panvk_physical_device(dev->vk.physical);
++   int host_type = -1;
++   for (uint32_t i = 0; i < pdev->memory.type_count; i++) {
++      if ((mr.memoryTypeBits & BITFIELD_BIT(i)) &&
++          (pdev->memory.types[i].propertyFlags &
++           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
++         host_type = i;
++         break;
++      }
++   }
++   if (host_type < 0)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   mai.allocationSize = mr.size;
++   mai.memoryTypeIndex = host_type;
++   result = t->AllocateMemory(h, &mai, NULL, &dev->null_descs.surf_mem);
++   if (result != VK_SUCCESS)
++      return result;
++   t->BindBufferMemory(h, dev->null_descs.surf_buffer, dev->null_descs.surf_mem, 0);
++
++   void *surfs;
++   result = t->MapMemory(h, dev->null_descs.surf_mem, 0, VK_WHOLE_SIZE, 0, &surfs);
++   if (result != VK_SUCCESS)
++      return result;
++   struct mali_surface_with_stride_packed *surf = surfs;
++   for (unsigned i = 0; i < nr_surfs; i++) {
++      pan_pack(&surf[i], SURFACE_WITH_STRIDE, cfg) {
++         cfg.pointer = dev->null_descs.zero_addr;
++         cfg.row_stride = 0;
++         cfg.surface_stride = 0;
++      }
++   }
++   const VkMappedMemoryRange range = {
++      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
++      .memory = dev->null_descs.surf_mem,
++      .size = VK_WHOLE_SIZE,
++   };
++   t->FlushMappedMemoryRanges(h, 1, &range);
++   t->UnmapMemory(h, dev->null_descs.surf_mem);
++
++   VK_FROM_HANDLE(panvk_buffer, surf_buf, dev->null_descs.surf_buffer);
++   struct mali_texture_packed *null_tex = (void *)dev->null_descs.tex;
++   pan_unpack(null_tex, TEXTURE, tex_cfg);
++   pan_pack(null_tex, TEXTURE, cfg) {
++      cfg = tex_cfg;
++      cfg.surfaces = panvk_buffer_gpu_ptr(surf_buf, 0);
++   }
++
+    dev->null_descs.valid = true;
+    return VK_SUCCESS;
+ }
+@@ -580,6 +645,10 @@ panvk_finish_null_descs(struct panvk_device *dev)
+       t->DestroyBuffer(h, dev->null_descs.buffer, NULL);
+    if (dev->null_descs.buffer_mem)
+       t->FreeMemory(h, dev->null_descs.buffer_mem, NULL);
++   if (dev->null_descs.surf_buffer)
++      t->DestroyBuffer(h, dev->null_descs.surf_buffer, NULL);
++   if (dev->null_descs.surf_mem)
++      t->FreeMemory(h, dev->null_descs.surf_mem, NULL);
+    memset(&dev->null_descs, 0, sizeof(dev->null_descs));
+ }
+ #endif
+-- 
+2.43.0
+

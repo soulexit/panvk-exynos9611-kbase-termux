@@ -1,0 +1,732 @@
+From f9ec50b4b46ab0eb8c4b8281db159d694a3902e6 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 18:24:22 +0300
+Subject: [PATCH 2/2] panvk/kbase: defer BO frees past open submissions;
+ validation and fault tooling
+
+- Keep BOs freed while a JM submission is open until every such submission
+  has completed. kbase holds no reference on job memory, unlike the DRM
+  drivers, so an early free became a GPU translation fault.
+- PANVK_VALIDATE=1: track live BO ranges, check every address a Bifrost
+  job's descriptors point at before submission, record frees with
+  alloc/free backtraces, and write /proc/self/maps plus the free history
+  next to the driver on the first failed submission.
+- PANVK_FORCE_ROBUST=1: bounds-check all UBO/SSBO accesses.
+- PANVK_KBASE_GROW_COMMIT_MB: initial commit of grow-on-fault heaps.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/lib/kmod/kbase_kmod.c          | 387 +++++++++++++++++++-
+ src/panfrost/lib/kmod/kbase_kmod.h          |   4 +
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 133 +++++++
+ src/panfrost/vulkan/panvk_vX_shader.c       |  23 +-
+ 4 files changed, 542 insertions(+), 5 deletions(-)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 17eaf5c..f3333d0 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -242,6 +242,12 @@ enum kbase_gpuprop {
+ 
+ struct kbase_sub;
+ struct kbase_csf_dev;
++struct pan_kmod_bo;
++
++struct kbase_deferred_free {
++   struct pan_kmod_bo *bo;
++   uint64_t seq;
++};
+ 
+ /* Submission state of a device, see "asynchronous submission". */
+ struct kbase_queue {
+@@ -258,6 +264,9 @@ struct kbase_queue {
+    uint64_t open_seq[256];
+    unsigned nr_open_seq;
+    unsigned in_flight;               /* submissions */
++   /* BOs freed while submissions were open, released once those complete. */
++   struct kbase_deferred_free *deferred;
++   unsigned nr_deferred, max_deferred;
+    pthread_t thread;
+    bool thread_started, stop, fence_warned;
+ };
+@@ -288,6 +297,7 @@ struct kbase_kmod_bo {
+     * the allocation's. NULL for an executable one, whose address comes from the kernel. */
+    void *anchor;
+    bool exec;
++   uintptr_t alloc_pc[8];
+ };
+ 
+ struct kbase_kmod_vm {
+@@ -613,6 +623,280 @@ kbase_kmod_dev_query_user_va_range(const struct pan_kmod_dev *dev)
+  * pan_kmod still wants a u32 handle to key its BO table on, so one is synthesised per device.
+  */
+ 
++/* The last BO frees, so a GPU page fault on an unmapped address (only in the
++ * kernel log) can be matched to the allocation that was released and to who
++ * released it. */
++#include <dlfcn.h>
++#include <time.h>
++#include <unwind.h>
++
++#define KBASE_FREE_RING 65536
++#define KBASE_FREE_FRAMES 8
++
++struct kbase_free_rec {
++   uint64_t va, size;
++   int64_t ns;
++   uintptr_t pc[KBASE_FREE_FRAMES];
++   uintptr_t alloc_pc[KBASE_FREE_FRAMES];
++};
++
++static struct kbase_free_rec kbase_free_ring[KBASE_FREE_RING];
++static uint32_t kbase_free_next;
++
++struct kbase_unwind_state {
++   uintptr_t *pc;
++   unsigned n, max;
++};
++
++static _Unwind_Reason_Code
++kbase_unwind_cb(struct _Unwind_Context *ctx, void *arg)
++{
++   struct kbase_unwind_state *st = arg;
++   uintptr_t pc = _Unwind_GetIP(ctx);
++   if (pc && st->n < st->max)
++      st->pc[st->n++] = pc;
++   return st->n < st->max ? _URC_NO_REASON : _URC_END_OF_STACK;
++}
++
++static bool kbase_live_enabled(void);
++
++static void
++kbase_record_free(uint64_t va, uint64_t size, const uintptr_t *alloc_pc)
++{
++   if (!kbase_live_enabled())
++      return;
++   uint32_t i = p_atomic_inc_return(&kbase_free_next) % KBASE_FREE_RING;
++   struct kbase_free_rec *r = &kbase_free_ring[i];
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   r->va = va;
++   r->size = size;
++   r->ns = ts.tv_sec * 1000000000ll + ts.tv_nsec;
++   memcpy(r->alloc_pc, alloc_pc, sizeof(r->alloc_pc));
++   memset(r->pc, 0, sizeof(r->pc));
++   struct kbase_unwind_state st = {.pc = r->pc, .max = KBASE_FREE_FRAMES};
++   _Unwind_Backtrace(kbase_unwind_cb, &st);
++}
++
++/* Once per process: /proc/self/maps (SAME_VA BOs show up at their GPU
++ * address) and the whole free ring, next to the driver, to match against a
++ * GPU page fault address from the kernel log. */
++void
++kbase_kmod_dump_maps_once(void)
++{
++   static bool done;
++   if (done)
++      return;
++   done = true;
++
++   Dl_info info;
++   if (!dladdr((void *)kbase_kmod_dump_maps_once, &info) || !info.dli_fname)
++      return;
++   char path[4096];
++   const char *slash = strrchr(info.dli_fname, '/');
++   snprintf(path, sizeof(path), "%.*s/fault-%d.txt",
++            slash ? (int)(slash - info.dli_fname) : 1, slash ? info.dli_fname : ".", getpid());
++   FILE *out = fopen(path, "w");
++   if (!out)
++      return;
++   FILE *maps = fopen("/proc/self/maps", "r");
++   char line[512];
++   while (maps && fgets(line, sizeof(line), maps)) {
++      fputs(line, out);
++   }
++   if (maps)
++      fclose(maps);
++   /* Pointers from GPU memory into big CPU-only anonymous mappings: a GPU
++    * page fault there means a descriptor holds a CPU address. */
++   struct { uint64_t lo, hi; bool gpu; } rg[4096];
++   unsigned nr = 0;
++   maps = fopen("/proc/self/maps", "r");
++   while (maps && nr < ARRAY_SIZE(rg) && fgets(line, sizeof(line), maps)) {
++      unsigned long long lo, hi;
++      char perms[5];
++      if (sscanf(line, "%llx-%llx %4s", &lo, &hi, perms) != 3)
++         continue;
++      bool mali = strstr(line, "mali") != NULL;
++      bool anon_big = !mali && !strchr(line, '/') && !strchr(line, '[') && hi - lo >= (64ull << 20);
++      if ((mali && perms[0] == 'r' && hi - lo < (64ull << 20)) || anon_big) {
++         rg[nr].lo = lo;
++         rg[nr].hi = hi;
++         rg[nr].gpu = mali;
++         nr++;
++      }
++   }
++   if (maps)
++      fclose(maps);
++   unsigned hits = 0;
++   for (unsigned i = 0; i < nr && hits < 200; i++) {
++      if (!rg[i].gpu)
++         continue;
++      const uint64_t *w = (const uint64_t *)(uintptr_t)rg[i].lo;
++      for (uint64_t k = 0; k < (rg[i].hi - rg[i].lo) / 8 && hits < 200; k++) {
++         uint64_t v = w[k] & ~0x3full;
++         if (v < 0x1000000000ull || v >= 0x8000000000ull)
++            continue;
++         for (unsigned j = 0; j < nr; j++) {
++            if (!rg[j].gpu && v >= rg[j].lo && v < rg[j].hi) {
++               uint64_t at = rg[i].lo + k * 8;
++               fprintf(out, "cpuptr %" PRIx64 " at %" PRIx64 " (region %" PRIx64 "+%" PRIx64 "):",
++                       w[k], at, rg[i].lo, at - rg[i].lo);
++               for (int d = -4; d < 8; d++) {
++                  if ((int64_t)k + d >= 0 && (k + d) * 8 < rg[i].hi - rg[i].lo)
++                     fprintf(out, " %016" PRIx64, w[k + d]);
++               }
++               fputc('\n', out);
++               hits++;
++               break;
++            }
++         }
++      }
++   }
++
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   int64_t now = ts.tv_sec * 1000000000ll + ts.tv_nsec;
++   for (unsigned k = 0; k < KBASE_FREE_RING; k++) {
++      const struct kbase_free_rec *r = &kbase_free_ring[k];
++      if (!r->size)
++         continue;
++      fprintf(out, "freed %" PRIx64 "-%" PRIx64 " %.3fs", r->va, r->va + r->size,
++              (now - r->ns) / 1e9);
++      for (unsigned f = 0; f < KBASE_FREE_FRAMES && r->pc[f]; f++) {
++         Dl_info fi;
++         if (dladdr((void *)r->pc[f], &fi) && fi.dli_fbase) {
++            const char *n = fi.dli_fname ? strrchr(fi.dli_fname, '/') : NULL;
++            fprintf(out, " %s+0x%" PRIxPTR, n ? n + 1 : "?", r->pc[f] - (uintptr_t)fi.dli_fbase);
++         }
++      }
++      fputs(" | alloc:", out);
++      for (unsigned f = 0; f < KBASE_FREE_FRAMES && r->alloc_pc[f]; f++) {
++         Dl_info fi;
++         if (dladdr((void *)r->alloc_pc[f], &fi) && fi.dli_fbase) {
++            const char *n = fi.dli_fname ? strrchr(fi.dli_fname, '/') : NULL;
++            fprintf(out, " %s+0x%" PRIxPTR, n ? n + 1 : "?", r->alloc_pc[f] - (uintptr_t)fi.dli_fbase);
++         }
++      }
++      fputc('\n', out);
++   }
++   fclose(out);
++   mesa_loge("kbase: wrote %s", path);
++}
++
++void
++kbase_kmod_dump_recent_frees(uint64_t lo, uint64_t hi)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   int64_t now = ts.tv_sec * 1000000000ll + ts.tv_nsec;
++   unsigned printed = 0;
++   for (unsigned k = 0; k < KBASE_FREE_RING && printed < 64; k++) {
++      const struct kbase_free_rec *r = &kbase_free_ring[k];
++      if (!r->size || r->va + r->size <= lo || r->va >= hi || now - r->ns > 3000000000ll)
++         continue;
++      char bt[512] = {0};
++      size_t off = 0;
++      for (unsigned f = 0; f < KBASE_FREE_FRAMES && r->pc[f]; f++) {
++         Dl_info info;
++         if (dladdr((void *)r->pc[f], &info) && info.dli_fbase) {
++            const char *name = info.dli_fname ? strrchr(info.dli_fname, '/') : NULL;
++            off += snprintf(bt + off, sizeof(bt) - off, " %s+0x%" PRIxPTR,
++                            name ? name + 1 : "?", r->pc[f] - (uintptr_t)info.dli_fbase);
++         }
++         if (off >= sizeof(bt))
++            break;
++      }
++      mesa_loge("kbase: freed 0x%" PRIx64 "-0x%" PRIx64 " %.3f s ago:%s", r->va,
++                r->va + r->size, (now - r->ns) / 1e9, bt);
++      printed++;
++   }
++}
++
++/* PANVK_VALIDATE: the live BO ranges, sorted by address, so the queue can
++ * check every GPU address it is about to hand the hardware. */
++struct kbase_live_range {
++   uint64_t lo, hi;
++};
++static struct {
++   pthread_mutex_t lock;
++   struct kbase_live_range *r;
++   unsigned n, max;
++   int enabled; /* -1 unknown */
++} kbase_live = {PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0, -1};
++
++static bool
++kbase_live_enabled(void)
++{
++   if (kbase_live.enabled < 0)
++      kbase_live.enabled = getenv("PANVK_VALIDATE") != NULL;
++   return kbase_live.enabled;
++}
++
++static unsigned
++kbase_live_lower_bound(uint64_t va)
++{
++   unsigned lo = 0, hi = kbase_live.n;
++   while (lo < hi) {
++      unsigned mid = (lo + hi) / 2;
++      if (kbase_live.r[mid].lo < va)
++         lo = mid + 1;
++      else
++         hi = mid;
++   }
++   return lo;
++}
++
++static void
++kbase_live_add(uint64_t va, uint64_t size)
++{
++   if (!kbase_live_enabled() || !va)
++      return;
++   pthread_mutex_lock(&kbase_live.lock);
++   if (kbase_live.n == kbase_live.max) {
++      unsigned max = MAX2(1024, kbase_live.max * 2);
++      void *r = realloc(kbase_live.r, max * sizeof(*kbase_live.r));
++      if (!r) {
++         pthread_mutex_unlock(&kbase_live.lock);
++         return;
++      }
++      kbase_live.r = r;
++      kbase_live.max = max;
++   }
++   unsigned i = kbase_live_lower_bound(va);
++   memmove(&kbase_live.r[i + 1], &kbase_live.r[i], (kbase_live.n - i) * sizeof(*kbase_live.r));
++   kbase_live.r[i] = (struct kbase_live_range){va, va + size};
++   kbase_live.n++;
++   pthread_mutex_unlock(&kbase_live.lock);
++}
++
++static void
++kbase_live_remove(uint64_t va)
++{
++   if (!kbase_live_enabled() || !va)
++      return;
++   pthread_mutex_lock(&kbase_live.lock);
++   unsigned i = kbase_live_lower_bound(va);
++   if (i < kbase_live.n && kbase_live.r[i].lo == va) {
++      memmove(&kbase_live.r[i], &kbase_live.r[i + 1],
++              (kbase_live.n - i - 1) * sizeof(*kbase_live.r));
++      kbase_live.n--;
++   }
++   pthread_mutex_unlock(&kbase_live.lock);
++}
++
++/* 1: [va, va + size) is inside a live BO. 0: it is not. -1: not tracking. */
++int
++kbase_kmod_va_check(uint64_t va, uint64_t size)
++{
++   if (!kbase_live_enabled())
++      return -1;
++   pthread_mutex_lock(&kbase_live.lock);
++   unsigned i = kbase_live_lower_bound(va + 1);
++   bool ok = i > 0 && kbase_live.r[i - 1].lo <= va && va + size <= kbase_live.r[i - 1].hi;
++   pthread_mutex_unlock(&kbase_live.lock);
++   return ok;
++}
++
+ static struct pan_kmod_bo *
+ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, uint64_t size,
+                     uint32_t flags)
+@@ -633,10 +917,16 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm,
+       return NULL;
+ 
+    const uint64_t pages = DIV_ROUND_UP(size, 4096);
++   /* PANVK_KBASE_GROW_COMMIT_MB: pages a grow-on-fault BO starts with. */
++   static int64_t grow_initial = -1;
++   if (grow_initial < 0) {
++      const char *mb = getenv("PANVK_KBASE_GROW_COMMIT_MB");
++      grow_initial = mb ? strtoull(mb, NULL, 0) * 256 : KBASE_GROW_INITIAL_PAGES;
++   }
+    union kbase_ioctl_mem_alloc req = {
+       .in = {
+          .va_pages = pages,
+-         .commit_pages = grow ? MIN2(pages, KBASE_GROW_INITIAL_PAGES) : pages,
++         .commit_pages = grow ? MIN2(pages, (uint64_t)grow_initial) : pages,
+          .extension = grow ? KBASE_GROW_STEP_PAGES : 0,
+          .flags = exec ? KBASE_MEM_FLAGS_EXEC
+                        : KBASE_MEM_FLAGS_RW | (grow ? BASE_MEM_GROW_ON_GPF : 0) |
+@@ -688,16 +978,25 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm,
+       bo->gpu_va = (uint64_t)(uintptr_t)anchor;
+    }
+ 
++   memset(bo->alloc_pc, 0, sizeof(bo->alloc_pc));
++   if (kbase_live_enabled()) {
++      struct kbase_unwind_state st = {.pc = bo->alloc_pc, .max = 8};
++      _Unwind_Backtrace(kbase_unwind_cb, &st);
++   }
+    pan_kmod_bo_init(&bo->base, dev, exclusive_vm, pages * 4096, flags,
+                     p_atomic_inc_return(&kbase_dev->next_handle));
++   kbase_live_add(bo->gpu_va, pages * 4096);
+    return &bo->base;
+ }
+ 
+ static void
+-kbase_kmod_bo_free(struct pan_kmod_bo *bo)
++kbase_kmod_bo_free_now(struct pan_kmod_bo *bo)
+ {
+    struct kbase_kmod_bo *kbase_bo = container_of(bo, struct kbase_kmod_bo, base);
+ 
++   kbase_record_free(kbase_bo->gpu_va, bo->size, kbase_bo->alloc_pc);
++   kbase_live_remove(kbase_bo->gpu_va);
++
+    if (kbase_bo->exec) {
+       struct kbase_ioctl_mem_free req = {.gpu_addr = kbase_bo->gpu_va};
+       if (pan_kmod_ioctl(bo->dev->fd, KBASE_IOCTL_MEM_FREE, &req))
+@@ -712,6 +1011,78 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
+    pan_kmod_dev_free(bo->dev, kbase_bo);
+ }
+ 
++/* kbase does not hold a reference on the memory a job uses, unlike the DRM
++ * drivers, which keep every BO of a job alive until the job is done. A BO
++ * freed while a submission that may use it is still running is unmapped
++ * under the GPU, which then faults (TRANSLATION_FAULT, JOB_READ_FAULT) and
++ * takes every dependent atom with it. Keep such BOs until every submission
++ * that was open when they were freed has completed. */
++static void
++kbase_kmod_bo_free(struct pan_kmod_bo *bo)
++{
++   struct kbase_kmod_dev *kdev = container_of(bo->dev, struct kbase_kmod_dev, base);
++   struct kbase_queue *q = &kdev->queue;
++
++   if (!kdev->csf) {
++      pthread_mutex_lock(&q->lock);
++      if (q->nr_open_seq) {
++         if (q->nr_deferred == q->max_deferred) {
++            unsigned max = MAX2(64, q->max_deferred * 2);
++            void *d = realloc(q->deferred, max * sizeof(*q->deferred));
++            if (d) {
++               q->deferred = d;
++               q->max_deferred = max;
++            }
++         }
++         if (q->nr_deferred < q->max_deferred) {
++            q->deferred[q->nr_deferred++] =
++               (struct kbase_deferred_free){.bo = bo, .seq = q->next_seq - 1};
++            pthread_mutex_unlock(&q->lock);
++            return;
++         }
++      }
++      pthread_mutex_unlock(&q->lock);
++   }
++
++   kbase_kmod_bo_free_now(bo);
++}
++
++/* Called with q->lock held: moves the BOs no open submission can still use
++ * to out[], returns how many. */
++static unsigned
++kbase_take_retired(struct kbase_queue *q, struct pan_kmod_bo **out, unsigned max)
++{
++   uint64_t oldest_open = UINT64_MAX;
++   for (unsigned k = 0; k < q->nr_open_seq; k++)
++      oldest_open = MIN2(oldest_open, q->open_seq[k]);
++
++   unsigned n = 0;
++   for (unsigned i = 0; i < q->nr_deferred && n < max;) {
++      if (q->deferred[i].seq < oldest_open) {
++         out[n++] = q->deferred[i].bo;
++         q->deferred[i] = q->deferred[--q->nr_deferred];
++      } else {
++         i++;
++      }
++   }
++   return n;
++}
++
++static void
++kbase_release_retired(struct kbase_queue *q)
++{
++   struct pan_kmod_bo *bos[64];
++   for (;;) {
++      pthread_mutex_lock(&q->lock);
++      unsigned n = kbase_take_retired(q, bos, ARRAY_SIZE(bos));
++      pthread_mutex_unlock(&q->lock);
++      for (unsigned i = 0; i < n; i++)
++         kbase_kmod_bo_free_now(bos[i]);
++      if (n < ARRAY_SIZE(bos))
++         break;
++   }
++}
++
+ static void *
+ kbase_kmod_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr)
+ {
+@@ -795,8 +1166,14 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
+    bo->exec = false;
+    bo->anchor = anchor;
+    bo->gpu_va = (uint64_t)(uintptr_t)anchor;
++   memset(bo->alloc_pc, 0, sizeof(bo->alloc_pc));
++   if (kbase_live_enabled()) {
++      struct kbase_unwind_state st = {.pc = bo->alloc_pc, .max = 8};
++      _Unwind_Backtrace(kbase_unwind_cb, &st);
++   }
+    pan_kmod_bo_init(&bo->base, dev, NULL, pages * 4096, PAN_KMOD_BO_FLAG_IMPORTED,
+                     p_atomic_inc_return(&kbase_dev->next_handle));
++   kbase_live_add(bo->gpu_va, pages * 4096);
+ 
+    struct pan_kmod_bo **slot = util_sparse_array_get(&dev->handle_to_bo.array, bo->base.handle);
+    if (!slot) {
+@@ -1601,6 +1978,8 @@ kbase_event_thread(void *arg)
+          pthread_mutex_unlock(&q->lock);
+          free(sub);
+       }
++      if (nr_finished)
++         kbase_release_retired(q);
+    }
+    return NULL;
+ }
+@@ -1630,6 +2009,10 @@ kbase_queue_finish(struct kbase_kmod_dev *kdev)
+    pthread_mutex_unlock(&q->lock);
+    if (started)
+       pthread_join(q->thread, NULL);
++   q->nr_open_seq = 0;
++   kbase_release_retired(q);
++   free(q->deferred);
++   q->deferred = NULL;
+    pthread_cond_destroy(&q->cond);
+    pthread_mutex_destroy(&q->lock);
+ }
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.h b/src/panfrost/lib/kmod/kbase_kmod.h
+index 3ec984c..bfedba8 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.h
++++ b/src/panfrost/lib/kmod/kbase_kmod.h
+@@ -174,4 +174,8 @@ bool pan_kmod_kbase_csf_wait(struct pan_kmod_kbase_csf_group *group, uint64_t se
+ int pan_kmod_kbase_csf_fence_fd(struct pan_kmod_kbase_csf_group *group, uint64_t seq);
+ bool pan_kmod_kbase_csf_group_faulted(const struct pan_kmod_kbase_csf_group *group);
+ 
++void kbase_kmod_dump_recent_frees(uint64_t lo, uint64_t hi);
++void kbase_kmod_dump_maps_once(void);
++int kbase_kmod_va_check(uint64_t va, uint64_t size);
++
+ #endif /* KBASE_KMOD_H */
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index c459f3d..dd9d1d1 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -43,6 +43,136 @@
+ static void panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
+                                         struct panvk_batch *batch);
+ 
++
++/* PANVK_VALIDATE=1: before a batch goes to the GPU, check that every address
++ * its jobs point at (shader, renderer state, tables, texture surfaces, UBOs,
++ * attribute buffers, indices) lies inside a live BO, and log the first ones
++ * that do not. kbase kills the job chain on such an access. */
++#if PAN_ARCH <= 7
++static unsigned panvk_validate_reports;
++
++static void
++panvk_validate_addr(const char *what, unsigned job, unsigned idx, uint64_t va, uint64_t size)
++{
++   if (!va || panvk_validate_reports >= 64)
++      return;
++   if (kbase_kmod_va_check(va, MAX2(size, 1)) != 0)
++      return;
++   panvk_validate_reports++;
++   mesa_loge("panvk validate: job %u %s[%u] = 0x%" PRIx64 " (+0x%" PRIx64 ") is not in a live BO",
++             job, what, idx, va, size);
++}
++
++static void
++panvk_validate_draw(unsigned job, const void *draw_desc)
++{
++   pan_unpack((const struct mali_draw_packed *)draw_desc, DRAW, d);
++
++   panvk_validate_addr("state", job, 0, d.state, pan_size(RENDERER_STATE));
++   panvk_validate_addr("tls", job, 0, d.thread_storage, pan_size(LOCAL_STORAGE));
++   panvk_validate_addr("push", job, 0, d.push_uniforms, 4);
++   if (!d.state || kbase_kmod_va_check(d.state, pan_size(RENDERER_STATE)) != 1)
++      return;
++
++   pan_unpack((const struct mali_renderer_state_packed *)(uintptr_t)d.state, RENDERER_STATE, rsd);
++   panvk_validate_addr("shader", job, 0, rsd.shader.shader & ~0xfull, 16);
++
++   if (rsd.shader.texture_count && d.textures) {
++      panvk_validate_addr("textures", job, 0, d.textures,
++                          rsd.shader.texture_count * pan_size(TEXTURE));
++      if (kbase_kmod_va_check(d.textures, rsd.shader.texture_count * pan_size(TEXTURE)) == 1) {
++         for (unsigned i = 0; i < rsd.shader.texture_count; i++) {
++            const struct mali_texture_packed *t =
++               (const void *)(uintptr_t)(d.textures + i * pan_size(TEXTURE));
++            pan_unpack(t, TEXTURE, tex);
++            panvk_validate_addr("tex.surfaces", job, i, tex.surfaces, pan_size(SURFACE_WITH_STRIDE));
++            if (tex.surfaces &&
++                kbase_kmod_va_check(tex.surfaces, pan_size(SURFACE_WITH_STRIDE)) == 1) {
++               pan_unpack((const struct mali_surface_with_stride_packed *)(uintptr_t)tex.surfaces,
++                          SURFACE_WITH_STRIDE, surf);
++               panvk_validate_addr("tex.surface0", job, i, surf.pointer, 1);
++            }
++         }
++      }
++   }
++
++   unsigned ubo_count = rsd.properties.uniform_buffer_count;
++   if (ubo_count && d.uniform_buffers) {
++      panvk_validate_addr("ubos", job, 0, d.uniform_buffers, ubo_count * pan_size(UNIFORM_BUFFER));
++      if (kbase_kmod_va_check(d.uniform_buffers, ubo_count * pan_size(UNIFORM_BUFFER)) == 1) {
++         for (unsigned i = 0; i < ubo_count; i++) {
++            pan_unpack((const struct mali_uniform_buffer_packed *)(uintptr_t)(
++                          d.uniform_buffers + i * pan_size(UNIFORM_BUFFER)),
++                       UNIFORM_BUFFER, ubo);
++            panvk_validate_addr("ubo", job, i, ubo.pointer, ubo.entries * 16);
++         }
++      }
++   }
++
++   unsigned attr_count = rsd.shader.attribute_count;
++   if (attr_count && d.attributes && d.attribute_buffers &&
++       kbase_kmod_va_check(d.attributes, attr_count * pan_size(ATTRIBUTE)) == 1) {
++      for (unsigned i = 0; i < attr_count; i++) {
++         pan_unpack((const struct mali_attribute_packed *)(uintptr_t)(
++                       d.attributes + i * pan_size(ATTRIBUTE)),
++                    ATTRIBUTE, attr);
++         uint64_t bva = d.attribute_buffers + attr.buffer_index * pan_size(ATTRIBUTE_BUFFER);
++         if (kbase_kmod_va_check(bva, pan_size(ATTRIBUTE_BUFFER)) != 1) {
++            panvk_validate_addr("attrib_buf_desc", job, i, bva, pan_size(ATTRIBUTE_BUFFER));
++            continue;
++         }
++         pan_unpack((const struct mali_attribute_buffer_packed *)(uintptr_t)bva, ATTRIBUTE_BUFFER, ab);
++         if (ab.type != MALI_ATTRIBUTE_TYPE_CONTINUATION && ab.size)
++            panvk_validate_addr("attrib_buf", job, i, ab.pointer, 1);
++      }
++   }
++}
++
++#endif
++
++static void
++panvk_validate_batch(struct panvk_batch *batch)
++{
++#if PAN_ARCH <= 7
++   static int enabled = -1;
++   if (enabled < 0)
++      enabled = getenv("PANVK_VALIDATE") != NULL;
++   if (!enabled)
++      return;
++
++   unsigned k = 0;
++   util_dynarray_foreach(&batch->jobs, void *, jobp) {
++      const uint8_t *job = *jobp;
++      const uint32_t *w = (const uint32_t *)job;
++      unsigned type = (w[4] >> 1) & 0x7f;
++      switch (type) {
++      case MALI_JOB_TYPE_COMPUTE:
++      case MALI_JOB_TYPE_VERTEX:
++         panvk_validate_draw(k, pan_section_ptr(job, COMPUTE_JOB, DRAW));
++         break;
++      case MALI_JOB_TYPE_TILER: {
++         pan_section_unpack(job, TILER_JOB, PRIMITIVE, prim);
++         panvk_validate_addr("indices", k, 0, prim.indices, 1);
++         panvk_validate_draw(k, pan_section_ptr(job, TILER_JOB, DRAW));
++         break;
++      }
++#if PAN_ARCH >= 6
++      case MALI_JOB_TYPE_INDEXED_VERTEX: {
++         pan_section_unpack(job, INDEXED_VERTEX_JOB, PRIMITIVE, prim);
++         panvk_validate_addr("indices", k, 0, prim.indices, 1);
++         panvk_validate_draw(k, pan_section_ptr(job, INDEXED_VERTEX_JOB, VERTEX_DRAW));
++         panvk_validate_draw(k, pan_section_ptr(job, INDEXED_VERTEX_JOB, FRAGMENT_DRAW));
++         break;
++      }
++#endif
++      default:
++         break;
++      }
++      k++;
++   }
++#endif
++}
++
+ /* What every batch needs before it is (re)submitted: a batch issued before is reset, and the
+  * command buffer's descriptors are made GPU-visible. */
+ static void
+@@ -73,6 +203,7 @@ panvk_queue_prepare_batch(struct panvk_device *dev, struct panvk_cmd_buffer *cmd
+    /* Flush pending synchronization requests before submitting the job, to
+     * make sure things are GPU-visible. */
+    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
++   panvk_validate_batch(batch);
+ }
+ 
+ /* A submission that did not complete: say which job stopped it. The job manager writes each
+@@ -171,6 +302,8 @@ panvk_kbase_submit_done(void *data, bool ok)
+    if (!ok) {
+       mesa_loge("panvk: the kbase submission did not complete");
+       panvk_kbase_report_faults(dev, d->cmdbufs, d->nr_cmdbufs);
++      if (getenv("PANVK_VALIDATE"))
++         kbase_kmod_dump_maps_once();
+    }
+ 
+    for (uint32_t j = 0; j < d->nr_cmdbufs; ++j) {
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index bd12a49..95e9a78 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -393,9 +393,26 @@ panvk_buffer_ubo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
+ 
+ /* A null SSBO (nullDescriptor) is address 0 with size 0 before v9: only the bounds-checked address
+  * format keeps accesses through it off address 0, so it is used whenever null descriptors are. */
++/* PANVK_FORCE_ROBUST=1 bounds-checks every UBO/SSBO access: on Mali an
++ * out-of-bounds read into an unmapped page kills the whole job chain, where
++ * desktop GPUs often tolerate it, and emulated guest shaders do such reads. */
++DEBUG_GET_ONCE_BOOL_OPTION(force_robust, "PANVK_FORCE_ROBUST", false)
++
++static inline VkPipelineRobustnessBufferBehaviorEXT
++panvk_ubo_robustness(const struct vk_pipeline_robustness_state *rs)
++{
++   if (debug_get_option_force_robust() &&
++       rs->uniform_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
++      return VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT;
++   return rs->uniform_buffers;
++}
++
+ static inline VkPipelineRobustnessBufferBehaviorEXT
+ panvk_ssbo_robustness(const struct vk_pipeline_robustness_state *rs)
+ {
++   if (debug_get_option_force_robust() &&
++       rs->storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
++      return VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT;
+    if (PAN_ARCH < 9 && rs->null_storage_buffer_descriptor &&
+        rs->storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
+       return VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT;
+@@ -460,7 +477,7 @@ panvk_get_spirv_options(UNUSED struct vk_physical_device *vk_pdev,
+                         const struct vk_pipeline_robustness_state *rs)
+ {
+    return (struct spirv_to_nir_options){
+-      .ubo_addr_format = panvk_buffer_ubo_addr_format(rs->uniform_buffers),
++      .ubo_addr_format = panvk_buffer_ubo_addr_format(panvk_ubo_robustness(rs)),
+       .ssbo_addr_format = panvk_buffer_ssbo_addr_format(panvk_ssbo_robustness(rs)),
+       .phys_ssbo_addr_format = nir_address_format_64bit_global,
+       .shared_addr_format = nir_address_format_32bit_offset,
+@@ -920,7 +937,7 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
+    NIR_PASS(_, nir, nir_lower_memcpy);
+ 
+    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
+-            panvk_buffer_ubo_addr_format(rs->uniform_buffers));
++            panvk_buffer_ubo_addr_format(panvk_ubo_robustness(rs)));
+    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
+             panvk_buffer_ssbo_addr_format(panvk_ssbo_robustness(rs)));
+    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
+@@ -1854,7 +1871,7 @@ panvk_compile_shader(struct panvk_device *dev,
+       return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    nir_variable_mode robust_modes = 0;
+-   if (info->robustness->uniform_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
++   if (panvk_ubo_robustness(info->robustness) != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
+       robust_modes |= nir_var_mem_ubo;
+    if (panvk_ssbo_robustness(info->robustness) != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
+       robust_modes |= nir_var_mem_ssbo;
+-- 
+2.43.0
+

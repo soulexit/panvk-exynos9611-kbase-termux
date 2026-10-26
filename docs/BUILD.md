@@ -17,6 +17,10 @@ Tested on Ubuntu 24.04 x86_64 with:
 | glslangValidator | 15.1.0 |
 | LLVM / clang / libclc / libLLVMSPIRVLib | 20.1 |
 
+v0.02 (base `d896b0a`) was built with **LLVM 20.1** and **NDK r30**. The base tree documents LLVM 21;
+20 works as long as clang, libclc and libLLVMSPIRVLib are all 20. Put that LLVM first in `PATH`
+(`PATH=/usr/lib/llvm-20/bin:$PATH ./scripts/build.sh …`) when several are installed.
+
 ### Packages
 
 Ubuntu 24.04:
@@ -59,7 +63,7 @@ cd panvk-exynos9611-kbase-termux
 ```
 
 `fetch-source.sh` clones the pinned base tree (blobless), checks out
-`fb3b49d016544c19d83e558462f2d29470e77c28`, and applies `patches/*.patch` in filename order.
+`d896b0a9c10b92f0f9d53ef3373006b79ed709e8`, and applies `patches/*.patch` in filename order.
 `build.sh` runs the base tree's two-stage build with `BUILD_DIR` pointed at this repository's
 `build/android`.
 

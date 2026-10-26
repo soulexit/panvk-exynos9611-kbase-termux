@@ -7,7 +7,7 @@ VERSION=$(cat "$ROOT/VERSION")
 
 # Pinned base tree. Never follow a moving branch: a build must be reproducible from this commit.
 SRC_REPO=${SRC_REPO:-https://github.com/JimVulkan/mali-panvk.git}
-SRC_COMMIT=${SRC_COMMIT:-fb3b49d016544c19d83e558462f2d29470e77c28}
+SRC_COMMIT=${SRC_COMMIT:-d896b0a9c10b92f0f9d53ef3373006b79ed709e8}
 SRC_DIR=${SRC_DIR:-$ROOT/build/src/mali-panvk}
 BUILD_DIR=${BUILD_DIR:-$ROOT/build/android}
 DIST_DIR=${DIST_DIR:-$ROOT/dist}

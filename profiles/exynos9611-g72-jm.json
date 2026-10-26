@@ -30,7 +30,7 @@
     "kernelInterface": "mali_kbase",
     "apiVersion": "1.3",
     "baseTree": "JimVulkan/mali-panvk",
-    "baseCommit": "fb3b49d016544c19d83e558462f2d29470e77c28"
+    "baseCommit": "d896b0a9c10b92f0f9d53ef3373006b79ed709e8"
   },
   "kbase": {
     "atomStride": 64,

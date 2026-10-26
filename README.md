@@ -48,8 +48,8 @@ This port therefore combines:
 | Item | Value |
 |---|---|
 | Base tree | [`JimVulkan/mali-panvk`](https://github.com/JimVulkan/mali-panvk) |
-| Pinned commit | `fb3b49d016544c19d83e558462f2d29470e77c28` |
-| Mesa version | `26.3.0-devel` |
+| Pinned commit | `d896b0a9c10b92f0f9d53ef3373006b79ed709e8` |
+| Mesa version | `27.0.0-devel` |
 | Base license | MIT (changes), Mesa per-file licenses |
 | Local patches | `patches/` (series applied on top of the pinned commit) |
 
@@ -79,7 +79,31 @@ Versioning is `v0.01`, `v0.02`, … for debug builds; a build only moves forward
 
 | Build | Date | Driver | Termux `vulkaninfo` | Winlator | ARMSX2 | Notes |
 |---|---|---|---|---|---|---|
+| v0.02 | 2026-10-26 | Mesa 27.0.0-devel + kbase JM + 2 local patches | **PASS** (L0 + L1 + offscreen) | **DXVK D3D9 PASS** — NFS Most Wanted intro/title/menu video at 50–60 FPS, 0 GPU faults | **PASS** — Kingdom Hearts, parity with v0.01 | New base; Eden reaches title + menus (gameplay still faults) |
 | v0.01 | 2026-10-21 | Mesa 26.3.0-devel + kbase JM | **PASS** (L0 + L1 + offscreen) | **swapchain PASS**, DXVK map failure | **PASS** — Kingdom Hearts native + 2x | First device build; see test log |
+
+### v0.02 changes
+
+- **New base:** `JimVulkan/mali-panvk` `d896b0a` (Mesa 27.0.0-devel): faster draws, IMapper 4.0
+  gralloc (falls back to the handle readers on the A51, which has no IMapper 4.0 in VINTF), and
+  **BCn emulation on Bifrost** (`textureCompressionBC = true`).
+- **Fix: crash in `vkCmdClearAttachments`** (`patches/0001`). Push descriptor storage held 32 slots,
+  but a combined image sampler takes several (texture planes + sampler descriptors), so a push set
+  with up to `maxPushDescriptors` combined samplers overflowed it and the meta save buffer
+  (SIGSEGV in `meta_gfx_end`). Eden hit this on its first frames.
+- **Fix: `DATA_INVALID_FAULT` (0x58) on null textures** (`patches/0001`). The Bifrost null texture
+  (robustness2 `nullDescriptor`) had a single surface; a shader sampling a null binding as an
+  array/cube made the GPU read past it and take a garbage surface pointer. It now points at a
+  256-entry surface table that reads zeroes.
+- **Deferred BO frees on kbase** (`patches/0002`). kbase does not hold job memory alive the way the
+  DRM drivers do; a BO freed while a submission is still running is now kept until that
+  submission completes.
+- **`panvk.env`** (`patches/0001`): `KEY=VALUE` lines in a file named `panvk.env` next to the driver
+  `.so` are applied at instance creation, so debug switches work inside Winlator, ARMSX2 and Eden.
+- **Fault tooling** (`patches/0001`, `0002`): on a failed kbase submission the faulting job, its
+  descriptor pointers and the memory at the fault address are logged; `PANVK_VALIDATE=1` checks
+  every descriptor address against the live BOs before submission. See
+  [`docs/DEBUGGING.md`](docs/DEBUGGING.md).
 
 ### v0.01 device validation
 
@@ -115,7 +139,10 @@ full test log.
 
 - **Mali-G72 is v6, the least-tested Bifrost path.** The base tree validates G72 on a Tab S6 Lite;
   the A51's Android 16 + kbase r38 combination is new and may expose kernel/ABI differences.
-- **No native BCn.** Winlator's Vulkan wrapper may decode BC textures; native BC is not implemented.
+- **BCn is emulated** (decoded on the GPU into a carrier format); `PANVK_NO_BC_EMU=1` turns it off.
+- **Eden gameplay faults.** Zelda: Echoes of Wisdom reaches the title screen and menus; loading a
+  save hits GPU translation faults (under investigation). Eden's *GPU unswizzle* option corrupts
+  textures on this driver — turn it off.
 - **No D3D12 / vkd3d-proton path.** That needs features this driver does not provide yet.
 - **GS/tessellation/XFB are compute-emulated**, so they are slow on a 3-core G72.
 - **4–6 GB shared RAM.** GPU allocations come out of the same memory as Android and Wine.
@@ -127,7 +154,7 @@ full test log.
 
 ```text
 README.md                  this file
-VERSION                    current debug build number (0.01)
+VERSION                    current debug build number (0.02)
 NOTICE.md                  attribution and licensing
 profiles/                  device/kbase profile (JSON)
 patches/                   local patch series on top of the pinned base commit
@@ -241,9 +268,9 @@ From a release zip:
 
 ```sh
 cd ~
-curl -LO https://github.com/soulexit/panvk-exynos9611-kbase-termux/releases/download/v0.01/panvk-exynos9611-termux-v0.01.zip
-unzip -o panvk-exynos9611-termux-v0.01.zip -d panvk-v001
-bash panvk-v001/install-termux.sh
+curl -LO https://github.com/soulexit/panvk-exynos9611-kbase-termux/releases/download/v0.02/panvk-exynos9611-termux-v0.02.zip
+unzip -o panvk-exynos9611-termux-v0.02.zip -d panvk-v002
+bash panvk-v002/install-termux.sh
 ```
 
 From a local build:
