@@ -1,0 +1,320 @@
+From 976e488e38be2378a9b7ebe60aae5b14857eeb4e Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Wed, 28 Oct 2026 00:38:56 +0300
+Subject: [PATCH 4/5] pan/bi: Mali-G72 (v6) compiler fixes; kbase fault reports
+ per atom
+
+Ported from the jm-v7 series (written for a Galaxy S9, Mali-G72):
+- 103: build the v6 ballot from CLPER_OLD instead of WMASK, which is
+  not a v6 instruction (INSTR_INVALID_ENC on every compute shader using
+  subgroup ballot/vote). This was what blacked out Eden gameplay.
+- 095: read_invocation uses the old CLPER encoding on G71/G72/G31.
+- 102: pack texture offsets with 32-bit shifts on v6.
+
+kbase: remember each atom's job chain; when an atom fails, walk the chain,
+log the job that faulted (decoding instruction-fault addresses) and, with
+PANVK_VALIDATE, save the shader that contains the fault next to the driver.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../compiler/bifrost/bifrost/bi_pack.c        |  3 +
+ .../compiler/bifrost/bifrost_compile.c        | 39 +++++++++
+ src/panfrost/compiler/pan_nir_lower_tex.c     | 25 +++++-
+ src/panfrost/lib/kmod/kbase_kmod.c            | 81 ++++++++++++++++---
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c   | 52 ++++++++++++
+ 5 files changed, 189 insertions(+), 11 deletions(-)
+
+diff --git a/src/panfrost/compiler/bifrost/bifrost/bi_pack.c b/src/panfrost/compiler/bifrost/bifrost/bi_pack.c
+index 9056128..7469615 100644
+--- a/src/panfrost/compiler/bifrost/bifrost/bi_pack.c
++++ b/src/panfrost/compiler/bifrost/bifrost/bi_pack.c
+@@ -615,6 +615,9 @@ bi_pack_clause(bi_context *ctx, bi_clause *clause, bi_clause *next_1,
+          assert(ctx->quirks & BIFROST_LIMITED_CLPER);
+       else if (add && add->op == BI_OPCODE_CLPER_I32)
+          assert(!(ctx->quirks & BIFROST_LIMITED_CLPER));
++
++      /* jm-v7 103: v6 has no WMASK (INSTR_INVALID_ENC on Mali-G72). */
++      assert(!(add && add->op == BI_OPCODE_WMASK && ctx->arch == 6));
+    }
+ 
+    bool ec0_packed = bi_ec0_packed(clause->tuple_count);
+diff --git a/src/panfrost/compiler/bifrost/bifrost_compile.c b/src/panfrost/compiler/bifrost/bifrost_compile.c
+index 1ebd9ef..e3c205f 100644
+--- a/src/panfrost/compiler/bifrost/bifrost_compile.c
++++ b/src/panfrost/compiler/bifrost/bifrost_compile.c
+@@ -1985,6 +1985,35 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
+    case nir_intrinsic_ballot:
+    case nir_intrinsic_ballot_relaxed: {
+       assert(instr->src[0].ssa->bit_size == 32);
++      /* jm-v7 103: WMASK is not a v6 instruction. On the FTL Galaxy S9
++       * (Mali-G72) every compute shader with a WMASK (subgroupAdd's
++       * active-lane mask, the 085 texture waterfall, the nir_lower_shuffle
++       * waterfall) ended with INSTR_INVALID_ENC (event 0x51); the same
++       * CLPER_OLD/CLZ/MUX code without WMASK runs. Like the full CLPER, WMASK
++       * (with its subgroup2/4/8 modifier) came with v7.
++       *
++       * Build the ballot of the 4-wide v6 warp from CLPER_OLD instead, which
++       * reads another lane and returns zero for an inactive one: each lane
++       * contributes (src & (1 << lane_id)), and the OR of the four lanes'
++       * values is the ballot of the active lanes.
++       */
++      if (b->shader->arch == 6) {
++         bi_index src = bi_src_index(&instr->src[0]);
++         bi_index lane = bi_mov_i32(b, bi_fau(BIR_FAU_LANE_ID, false));
++         bi_index bit =
++            bi_lshift_or_i32(b, bi_imm_u32(1), bi_zero(), bi_byte(lane, 0));
++         bi_index mine = bi_lshift_and_i32(b, bit, src, bi_imm_u8(0));
++         bi_index acc = bi_clper_old_i32(b, mine, bi_imm_u8(0));
++         unsigned lanes = pan_subgroup_size(b->shader->arch);
++         for (unsigned i = 1; i < lanes; i++) {
++            bi_index other = bi_clper_old_i32(b, mine, bi_imm_u8(i));
++            if (i + 1 < lanes)
++               acc = bi_lshift_or_i32(b, other, acc, bi_imm_u8(0));
++            else
++               bi_lshift_or_i32_to(b, dst, other, acc, bi_imm_u8(0));
++         }
++         break;
++      }
+       enum bi_subgroup subgroup =
+          bi_subgroup_from_cluster_size(pan_subgroup_size(b->shader->arch));
+       bi_wmask_to(b, dst, bi_src_index(&instr->src[0]), subgroup, 0);
+@@ -1997,6 +2026,16 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
+       enum bi_lane_op lane_op = BI_LANE_OP_NONE;
+       enum bi_subgroup subgroup =
+          bi_subgroup_from_cluster_size(pan_subgroup_size(b->shader->arch));
++      /* jm-v7 095: G71/G72/G31 only have the old CLPER encoding (the
++       * packer asserts on CLPER.i32 there). It is fixed to inactive=zero,
++       * subgroup4, no lane op, which is exactly read_invocation for the
++       * 4-wide v6 subgroup.
++       */
++      if (b->shader->quirks & BIFROST_LIMITED_CLPER) {
++         bi_clper_old_i32_to(b, dst, bi_src_index(&instr->src[0]),
++                             bi_src_index(&instr->src[1]));
++         break;
++      }
+       bi_clper_i32_to(b, dst,
+                       bi_src_index(&instr->src[0]),
+                       bi_byte(bi_src_index(&instr->src[1]), 0),
+diff --git a/src/panfrost/compiler/pan_nir_lower_tex.c b/src/panfrost/compiler/pan_nir_lower_tex.c
+index 4b9700c..a1ea1b1 100644
+--- a/src/panfrost/compiler/pan_nir_lower_tex.c
++++ b/src/panfrost/compiler/pan_nir_lower_tex.c
+@@ -611,8 +611,29 @@ bi_lower_tex(nir_builder *b, nir_tex_instr *tex, unsigned arch)
+             comps[i] = nir_get_scalar(nir_imm_int(b, 0), 0);
+       }
+ 
+-      sr[BI_TEX_SR_OFFSET] =
+-         nir_pack_32_4x8(b, nir_i2i8(b, nir_vec_scalars(b, comps, 4)));
++      if (arch == 6) {
++         /* jm-v7 102: pack the u8vec4 with 32-bit shifts on v6. The 8-bit
++          * vector pack (MKVEC.v4i8 and friends) of a non-constant offset
++          * faulted with INSTR_INVALID_ENC (event 0x51) on the FTL Galaxy S9
++          * (Mali-G72): PanProbe sampler gather_offsets, whose only
++          * difference from the passing gather case is a dynamic
++          * textureGatherOffset. Constant offsets fold to the same
++          * immediate as before.
++          */
++         nir_def *packed = NULL;
++         for (unsigned i = 0; i < 4; i++) {
++            nir_def *c = nir_u2u32(b, nir_mov_scalar(b, comps[i]));
++            if (i < 3)
++               c = nir_iand_imm(b, c, 0xff);
++            if (i)
++               c = nir_ishl_imm(b, c, i * 8);
++            packed = packed ? nir_ior(b, packed, c) : c;
++         }
++         sr[BI_TEX_SR_OFFSET] = packed;
++      } else {
++         sr[BI_TEX_SR_OFFSET] =
++            nir_pack_32_4x8(b, nir_i2i8(b, nir_vec_scalars(b, comps, 4)));
++      }
+       desc.offset_or_bias_disable = true;
+    }
+ 
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index d551e80..cd63aaf 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -263,6 +263,7 @@ struct kbase_queue {
+     * submission, not as a high-water mark. */
+    uint64_t open_seq[256];
+    unsigned nr_open_seq;
++   uint64_t jc[256];                 /* job chain of each atom in flight, for fault reports */
+    unsigned in_flight;               /* submissions */
+    /* BOs freed while submissions were open, released once those complete. */
+    struct kbase_deferred_free *deferred;
+@@ -944,15 +945,6 @@ kbase_kmod_shader_lookup(uint64_t va, size_t *size)
+          break;
+       }
+    }
+-   if (!bin) {
+-      uint64_t best = 0;
+-      for (unsigned i = 0; i < kbase_shaders.n; i++) {
+-         if (kbase_shaders.e[i].va <= va && kbase_shaders.e[i].va > best)
+-            best = kbase_shaders.e[i].va;
+-      }
+-      mesa_loge("kbase: shader 0x%" PRIx64 " not among %u registered (closest below 0x%" PRIx64 ")",
+-                va, kbase_shaders.n, best);
+-   }
+    pthread_mutex_unlock(&kbase_shaders.lock);
+    return bin;
+ }
+@@ -1962,6 +1954,75 @@ kbase_queue(struct pan_kmod_dev *dev)
+    return &container_of(dev, struct kbase_kmod_dev, base)->queue;
+ }
+ 
++
++/* The first few failed atoms: walk the job chain, report the job that did not finish, and when
++ * its fault address lies in a known shader (PANVK_VALIDATE registers them), save that shader. */
++static void
++kbase_report_bad_chain(unsigned an, uint64_t jc, unsigned code)
++{
++   static unsigned reports;
++   if (reports >= 6 || !jc)
++      return;
++   reports++;
++
++   uint64_t job = jc;
++   for (unsigned n = 0; job && n < 1024; n++) {
++      const uint32_t *w = (const uint32_t *)(uintptr_t)job;
++      const uint32_t status = w[0];
++      uint64_t fault = (uint64_t)w[2] | ((uint64_t)w[3] << 32);
++      const unsigned type = (w[4] >> 1) & 0x7f;
++      if (status > 1) {
++         size_t size = 0;
++         /* Instruction faults report the clause address >> 4 with flags above bit 40. */
++         if (status >= 0x50 && status <= 0x57)
++            fault = (fault & 0xffffffffffull) << 4;
++         const void *bin = fault ? kbase_kmod_shader_lookup(fault, &size) : NULL;
++         /* Compute and vertex jobs: the draw descriptor at +64 holds the renderer state at
++          * word 14, whose first word is the shader. */
++         uint64_t shader_va = 0;
++         if (type == 4 || type == 5) {
++            const uint64_t rsd = *(const uint64_t *)(uintptr_t)(job + 64 + 14 * 4);
++            if (rsd)
++               shader_va = *(const uint64_t *)(uintptr_t)rsd & ~0xfull;
++            mesa_loge("kbase:   job shader 0x%" PRIx64 " (rsd 0x%" PRIx64 ")", shader_va, rsd);
++            if (!bin && shader_va) {
++               bin = kbase_kmod_shader_lookup(shader_va, &size);
++               if (bin)
++                  fault = shader_va;
++            }
++         }
++         mesa_loge("kbase: atom %u (code %u) job 0x%" PRIx64 " type %u status 0x%x fault 0x%" PRIx64
++                   "%s", an, code, job, type, status, fault, bin ? " (in a known shader)" : "");
++         if (bin) {
++            /* lookup returns the shader from the fault address on: find its start. */
++            uint64_t start = fault;
++            size_t s2 = 0;
++            while (start >= 16 && kbase_kmod_shader_lookup(start - 16, &s2))
++               start -= 16;
++            const void *sh = kbase_kmod_shader_lookup(start, &s2);
++            Dl_info info;
++            if (sh && dladdr((void *)kbase_report_bad_chain, &info) && info.dli_fname) {
++               char path[4096];
++               const char *slash = strrchr(info.dli_fname, '/');
++               snprintf(path, sizeof(path), "%.*s/badshader-%d-%u.bin",
++                        slash ? (int)(slash - info.dli_fname) : 1,
++                        slash ? info.dli_fname : ".", getpid(), reports);
++               FILE *f = fopen(path, "wb");
++               if (f) {
++                  fwrite(sh, 1, s2, f);
++                  fclose(f);
++                  mesa_loge("kbase:   shader 0x%" PRIx64 " (%zu bytes, fault at +0x%" PRIx64
++                            ") saved to %s", start, s2, fault - start, path);
++               }
++            }
++         }
++         return;
++      }
++      job = (uint64_t)w[6] | ((uint64_t)w[7] << 32);
++   }
++   mesa_loge("kbase: atom %u (code %u): no job in its chain reports a fault", an, code);
++}
++
+ static void *
+ kbase_event_thread(void *arg)
+ {
+@@ -2015,6 +2076,7 @@ kbase_event_thread(void *arg)
+             } else {
+                mesa_loge("kbase: atom %u finished with event code %u, not DONE", an,
+                          ev[i].event_code);
++               kbase_report_bad_chain(an, q->jc[an], ev[i].event_code);
+                sub->ok = false;
+             }
+          }
+@@ -2163,6 +2225,7 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
+    for (unsigned i = 0; i < nr_atoms; i++) {
+       assert(atoms[i].atom_number != 0);
+       jd[i].jc = atoms[i].jc;
++      q->jc[real[i]] = atoms[i].jc;
+       jd[i].core_req = atoms[i].core_req;
+       jd[i].atom_number = real[i];
+       /* udata is opaque to the kernel and comes back verbatim in the completion event: the tag
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 917a796..5feb135 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -366,6 +366,58 @@ panvk_dump_fault_draws(struct panvk_batch *batch, unsigned b)
+          draws[1] = pan_section_ptr(job, INDEXED_VERTEX_JOB, FRAGMENT_DRAW);
+       }
+       fprintf(txt, "job %u type %u status 0x%x\n", k, type, w[0]);
++      if (type == MALI_JOB_TYPE_FRAGMENT) {
++         pan_section_unpack(job, FRAGMENT_JOB, PAYLOAD, frag);
++         uint64_t fbd = frag.framebuffer & ~0x3full;
++         fprintf(txt, " fbd 0x%" PRIx64 " bounds %u,%u-%u,%u\n", fbd, frag.bound_min_x,
++                 frag.bound_min_y, frag.bound_max_x, frag.bound_max_y);
++         if (fbd && kbase_kmod_va_check(fbd, 128 + 64 * 9) != 0) {
++            const uint32_t *fw = (const uint32_t *)(uintptr_t)fbd;
++            fprintf(txt, "  fbd words:");
++            for (unsigned i = 0; i < 32 + 16 + 16 * 2; i++)
++               fprintf(txt, " %08x", fw[i]);
++            fputc('\n', txt);
++            pan_section_unpack((const void *)(uintptr_t)fbd, FRAMEBUFFER, PARAMETERS, fbp);
++            fprintf(txt, "  pre0 %u pre1 %u post %u dcds 0x%" PRIx64 " rts %u zs_ext %u\n",
++                    fbp.pre_frame_0, fbp.pre_frame_1, fbp.post_frame, fbp.frame_shader_dcds,
++                    fbp.render_target_count, fbp.has_zs_crc_extension);
++            const enum mali_pre_post_frame_shader_mode modes[3] = {
++               fbp.pre_frame_0, fbp.pre_frame_1, fbp.post_frame};
++            for (unsigned fi = 0; fi < 3; fi++) {
++               if (modes[fi] == MALI_PRE_POST_FRAME_SHADER_MODE_NEVER || !fbp.frame_shader_dcds)
++                  continue;
++               uint64_t dcd = fbp.frame_shader_dcds + fi * pan_size(DRAW);
++               pan_unpack((const struct mali_draw_packed *)(uintptr_t)dcd, DRAW, fd);
++               fprintf(txt, "  frame shader %u: textures 0x%" PRIx64 " state 0x%" PRIx64 "\n", fi,
++                       fd.textures, fd.state);
++               if (fd.state && kbase_kmod_va_check(fd.state, 64) != 0) {
++                  pan_unpack((const struct mali_renderer_state_packed *)(uintptr_t)fd.state,
++                             RENDERER_STATE, frs);
++                  for (unsigned ti = 0; ti < frs.shader.texture_count && ti < 8; ti++) {
++                     uint64_t tva = fd.textures + ti * pan_size(TEXTURE);
++                     if (kbase_kmod_va_check(tva, pan_size(TEXTURE)) == 0)
++                        continue;
++                     const uint32_t *tw = (const uint32_t *)(uintptr_t)tva;
++                     pan_unpack((const struct mali_texture_packed *)tw, TEXTURE, tex);
++                     fprintf(txt, "   tex %u: dim %u %ux%u levels %u array %u depth %u surfaces 0x%"
++                             PRIx64 " words %08x %08x %08x %08x %08x %08x %08x %08x\n",
++                             ti, tex.dimension, tex.width, tex.height, tex.levels, tex.array_size,
++                             tex.depth, tex.surfaces, tw[0], tw[1], tw[2], tw[3], tw[4], tw[5],
++                             tw[6], tw[7]);
++                     for (unsigned si = 0; si < 4 && tex.surfaces; si++) {
++                        uint64_t sva = tex.surfaces + si * pan_size(SURFACE_WITH_STRIDE);
++                        if (kbase_kmod_va_check(sva, 16) == 0)
++                           break;
++                        pan_unpack((const struct mali_surface_with_stride_packed *)(uintptr_t)sva,
++                                   SURFACE_WITH_STRIDE, surf);
++                        fprintf(txt, "    surf %u: 0x%" PRIx64 " row %" PRId64 " surface %" PRId64 "\n", si,
++                                surf.pointer, surf.row_stride, surf.surface_stride);
++                     }
++                  }
++               }
++            }
++         }
++      }
+       for (unsigned di = 0; di < 2 && draws[di]; di++) {
+          const uint32_t *dw = draws[di];
+          fprintf(txt, " draw%u:", di);
+-- 
+2.43.0
+

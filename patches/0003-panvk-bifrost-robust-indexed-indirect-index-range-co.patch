@@ -1,0 +1,594 @@
+From e96f6900bb2fe689df040380b98b5f6315d37c16 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Tue, 27 Oct 2026 23:56:46 +0300
+Subject: [PATCH 3/5] panvk/bifrost: robust indexed-indirect index range,
+ copy-shader guard, fault tooling
+
+- Clamp firstIndex/indexCount of batched indexed indirect draws to the
+  bound index buffer in the GPU min/max scan and patch kernels.
+- vk_meta buffer-to-image copy: discard fragments whose copy coordinates
+  are negative; the 32-bit buffer offset otherwise wraps ~4 GiB past the
+  buffer.
+- PANVK_VALIDATE now also checks fragment jobs (FBD, frame shader DCDs,
+  render target words), varyings, full texture surface tables and the
+  descriptor-copy set addresses; on a failed submission it dumps the
+  draws of the batches that stopped (descriptors + shader binaries) next
+  to the driver, and logs which emulated draw paths an app reaches.
+- PANVK_KBASE_NO_DEFER, PANVK_NO_CPU_INDEX_SCAN: bisect switches.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/lib/kmod/kbase_kmod.c            |  66 +++++-
+ src/panfrost/lib/kmod/kbase_kmod.h            |   2 +
+ src/panfrost/libpan/draw_helper.cl            |  10 +-
+ src/panfrost/libpan/draw_helper.h             |   3 +-
+ .../vulkan/bifrost/panvk_vX_meta_desc_copy.c  |  14 ++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c    |  35 +++
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c   | 201 +++++++++++++++++-
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c       |   5 +-
+ src/panfrost/vulkan/panvk_vX_shader.c         |   3 +
+ src/vulkan/runtime/vk_meta_copy_fill_update.c |   5 +
+ 10 files changed, 330 insertions(+), 14 deletions(-)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index f3333d0..d551e80 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -897,6 +897,66 @@ kbase_kmod_va_check(uint64_t va, uint64_t size)
+    return ok;
+ }
+ 
++/* PANVK_VALIDATE: shader binaries by GPU address, for fault dumps (shader code is not
++ * CPU-readable at its GPU address). */
++static struct {
++   pthread_mutex_t lock;
++   struct { uint64_t va; const void *bin; size_t size; } *e;
++   unsigned n, max;
++} kbase_shaders = {PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0};
++
++void
++kbase_kmod_shader_register(uint64_t va, const void *bin, size_t size)
++{
++   if (!kbase_live_enabled() || !va)
++      return;
++   pthread_mutex_lock(&kbase_shaders.lock);
++   if (kbase_shaders.n == kbase_shaders.max) {
++      unsigned max = MAX2(256, kbase_shaders.max * 2);
++      void *e = realloc(kbase_shaders.e, max * sizeof(*kbase_shaders.e));
++      if (e) {
++         kbase_shaders.e = e;
++         kbase_shaders.max = max;
++      }
++   }
++   if (kbase_shaders.n < kbase_shaders.max) {
++      void *copy = malloc(size);
++      if (copy) {
++         memcpy(copy, bin, size);
++         kbase_shaders.e[kbase_shaders.n].va = va;
++         kbase_shaders.e[kbase_shaders.n].bin = copy;
++         kbase_shaders.e[kbase_shaders.n].size = size;
++         kbase_shaders.n++;
++      }
++   }
++   pthread_mutex_unlock(&kbase_shaders.lock);
++}
++
++const void *
++kbase_kmod_shader_lookup(uint64_t va, size_t *size)
++{
++   const void *bin = NULL;
++   pthread_mutex_lock(&kbase_shaders.lock);
++   for (unsigned i = kbase_shaders.n; i-- > 0;) {
++      if (va >= kbase_shaders.e[i].va && va < kbase_shaders.e[i].va + kbase_shaders.e[i].size) {
++         bin = (const uint8_t *)kbase_shaders.e[i].bin + (va - kbase_shaders.e[i].va);
++         *size = kbase_shaders.e[i].size - (va - kbase_shaders.e[i].va);
++         break;
++      }
++   }
++   if (!bin) {
++      uint64_t best = 0;
++      for (unsigned i = 0; i < kbase_shaders.n; i++) {
++         if (kbase_shaders.e[i].va <= va && kbase_shaders.e[i].va > best)
++            best = kbase_shaders.e[i].va;
++      }
++      mesa_loge("kbase: shader 0x%" PRIx64 " not among %u registered (closest below 0x%" PRIx64 ")",
++                va, kbase_shaders.n, best);
++   }
++   pthread_mutex_unlock(&kbase_shaders.lock);
++   return bin;
++}
++
+ static struct pan_kmod_bo *
+ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, uint64_t size,
+                     uint32_t flags)
+@@ -1023,7 +1083,11 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
+    struct kbase_kmod_dev *kdev = container_of(bo->dev, struct kbase_kmod_dev, base);
+    struct kbase_queue *q = &kdev->queue;
+ 
+-   if (!kdev->csf) {
++   static int no_defer = -1;
++   if (no_defer < 0)
++      no_defer = getenv("PANVK_KBASE_NO_DEFER") != NULL;
++
++   if (!kdev->csf && !no_defer) {
+       pthread_mutex_lock(&q->lock);
+       if (q->nr_open_seq) {
+          if (q->nr_deferred == q->max_deferred) {
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.h b/src/panfrost/lib/kmod/kbase_kmod.h
+index bfedba8..97390e9 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.h
++++ b/src/panfrost/lib/kmod/kbase_kmod.h
+@@ -177,5 +177,7 @@ bool pan_kmod_kbase_csf_group_faulted(const struct pan_kmod_kbase_csf_group *gro
+ void kbase_kmod_dump_recent_frees(uint64_t lo, uint64_t hi);
+ void kbase_kmod_dump_maps_once(void);
+ int kbase_kmod_va_check(uint64_t va, uint64_t size);
++void kbase_kmod_shader_register(uint64_t va, const void *bin, size_t size);
++const void *kbase_kmod_shader_lookup(uint64_t va, size_t *size);
+ 
+ #endif /* KBASE_KMOD_H */
+diff --git a/src/panfrost/libpan/draw_helper.cl b/src/panfrost/libpan/draw_helper.cl
+index 599dc03..704943c 100644
+--- a/src/panfrost/libpan/draw_helper.cl
++++ b/src/panfrost/libpan/draw_helper.cl
+@@ -660,8 +660,8 @@ panlib_draw_batch_scan_entry(global struct libpan_draw_batch_entry *e, uint32_t
+       return;
+ 
+    global VkDrawIndexedIndirectCommand *cmd = (global VkDrawIndexedIndirectCommand *)e->cmd;
+-   const uint32_t start = cmd->firstIndex;
+-   const uint32_t count = cmd->indexCount;
++   const uint32_t start = min(cmd->firstIndex, e->index_buffer_size_el);
++   const uint32_t count = min(cmd->indexCount, e->index_buffer_size_el - start);
+    const bool restart = e->primitive_restart != 0;
+    uint32_t lo = UINT32_MAX, hi = 0;
+ 
+@@ -751,11 +751,13 @@ panlib_draw_batch_patch(global struct libpan_draw_batch *batch)
+          global VkDrawIndexedIndirectCommand *cmd = (global VkDrawIndexedIndirectCommand *)e->cmd;
+          const uint32_t lo = e->index_min, hi = e->index_max;
+ 
++         const uint32_t first = min(cmd->firstIndex, e->index_buffer_size_el);
++
+          draw.index.size = e->index_size;
+-         draw.index.offset = cmd->firstIndex;
++         draw.index.offset = first;
+          draw.vertex.base = cmd->vertexOffset;
+          draw.vertex.raw_offset = lo + cmd->vertexOffset;
+-         draw.vertex.count = cmd->indexCount;
++         draw.vertex.count = min(cmd->indexCount, e->index_buffer_size_el - first);
+          draw.instance.base = cmd->firstInstance;
+          draw.instance.count = cmd->instanceCount;
+          /* No index but restarts: nothing to draw. */
+diff --git a/src/panfrost/libpan/draw_helper.h b/src/panfrost/libpan/draw_helper.h
+index aba34cd..b47c3cf 100644
+--- a/src/panfrost/libpan/draw_helper.h
++++ b/src/panfrost/libpan/draw_helper.h
+@@ -65,7 +65,8 @@ struct libpan_draw_batch_entry {
+     uint32_t attribs_valid;
+     uint32_t index_min;            /* scan result: UINT32_MAX and 0 before the scan and after */
+     uint32_t index_max;            /* the patch, so the command buffer can run again */
+-    uint32_t pad;
++    uint32_t index_buffer_size_el; /* indices the bound buffer holds: firstIndex and indexCount
++                                      are clamped to it (robust index fetch) */
+ };
+ 
+ struct libpan_draw_batch {
+diff --git a/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c b/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
+index 6047c4c..4095f91 100644
+--- a/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
++++ b/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
+@@ -15,6 +15,7 @@
+ #include "pan_nir.h"
+ #include "pan_shader.h"
+ 
++#include "kmod/kbase_kmod.h"
+ #include "panvk_cmd_alloc.h"
+ #include "panvk_cmd_buffer.h"
+ #include "panvk_device.h"
+@@ -514,6 +515,19 @@ panvk_per_arch(meta_get_copy_desc_job)(
+ 
+       copy_info.sets[i] = set->descs.dev;
+       copy_info.set_desc_counts[i] = set->desc_count;
++
++      static int validate = -1;
++      if (validate < 0)
++         validate = getenv("PANVK_VALIDATE") != NULL;
++      if (validate && set->desc_count &&
++          kbase_kmod_va_check(set->descs.dev, set->desc_count * PANVK_DESCRIPTOR_SIZE) == 0) {
++         static unsigned reports;
++         if (reports++ < 32)
++            mesa_loge("panvk validate: copy-desc set %u at 0x%" PRIx64 " (%u descs, push=%d, "
++                      "host=%p) is not in a live BO",
++                      i, set->descs.dev, set->desc_count,
++                      set == desc_state->push_sets[i], set->descs.host);
++      }
+    }
+ 
+    for (uint32_t i = 0; i < ARRAY_SIZE(desc_info->others.count); i++) {
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 66e3b49..324ee95 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -98,6 +98,8 @@ struct panvk_draw_data {
+ 
+ /* Geometry shader input assembly: how the draw's topology groups vertices into the shader's
+  * input primitives, and how many primitives one instance makes. */
++static void panvk_note_path(const char *what);
++
+ static enum panvk_gs_topology
+ gs_topology(enum mesa_prim prim)
+ {
+@@ -653,6 +655,7 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
+          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ 
+       draw->gs_varying_bufs = gs_bufs.gpu;
++      panvk_note_path("geometry shader emulation");
+       cmdbuf->state.gfx.gs.out_pos = gs_addrs[PANVK_VARY_BUF_POSITION];
+       cmdbuf->state.gfx.gs.out_general = gs_addrs[PANVK_VARY_BUF_GENERAL];
+       cmdbuf->state.gfx.gs.out_index = idx.gpu;
+@@ -2410,6 +2413,7 @@ emit_emulation_jobs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *dra
+    uint64_t tess_params = 0, tess_count = 0;
+ 
+    if (tes) {
++      panvk_note_path("tessellation emulation");
+       dep = emit_tess_jobs(cmdbuf, draw, dep, &tess_params, &tess_count);
+       if (!dep)
+          return 0;
+@@ -2534,6 +2538,31 @@ panvk_select_gs(struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_data *d
+    }
+ }
+ 
++
++/* PANVK_VALIDATE: say once which emulated draw paths an app reaches. */
++static void
++panvk_note_path(const char *what)
++{
++   static int enabled = -1;
++   if (enabled < 0)
++      enabled = getenv("PANVK_VALIDATE") != NULL;
++   if (!enabled)
++      return;
++   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
++   static const char *seen[16];
++   simple_mtx_lock(&lock);
++   for (unsigned i = 0; i < ARRAY_SIZE(seen); i++) {
++      if (seen[i] == what)
++         break;
++      if (!seen[i]) {
++         seen[i] = what;
++         mesa_logi("panvk path: %s", what);
++         break;
++      }
++   }
++   simple_mtx_unlock(&lock);
++}
++
+ static void
+ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
+ {
+@@ -2708,6 +2737,7 @@ static void
+ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+                         struct panvk_draw_data *draw)
+ {
++   panvk_note_path(draw->info.index.index_size ? "indexed indirect draw" : "indirect draw");
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+    const struct panvk_shader_variant *vs = panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+    VkResult result;
+@@ -2810,8 +2840,13 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+          .attribs_valid = vi->attributes_valid,
+          .index_min = UINT32_MAX,
+          .index_max = 0,
++         .index_buffer_size_el = UINT32_MAX,
+       };
+ 
++      if (draw->info.index.index_size &&
++          draw->info.index.buffer_dev_addr == cmdbuf->state.gfx.ib.dev_addr)
++         e.index_buffer_size_el = cmdbuf->state.gfx.ib.size / draw->info.index.index_size;
++
+       if (shader_uses_sysval(vs, graphics, vs.first_vertex)) {
+          e.first_vertex_sysval = cmdbuf->state.gfx.vs.push_uniforms +
+                                  shader_remapped_sysval_offset(
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index dd9d1d1..917a796 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -29,6 +29,7 @@
+ #include "vk_drm_syncobj.h"
+ #include "vk_framebuffer.h"
+ 
++#include <dlfcn.h>
+ #include <stdio.h>
+ #include <unistd.h>
+ 
+@@ -85,12 +86,26 @@ panvk_validate_draw(unsigned job, const void *draw_desc)
+             const struct mali_texture_packed *t =
+                (const void *)(uintptr_t)(d.textures + i * pan_size(TEXTURE));
+             pan_unpack(t, TEXTURE, tex);
+-            panvk_validate_addr("tex.surfaces", job, i, tex.surfaces, pan_size(SURFACE_WITH_STRIDE));
+-            if (tex.surfaces &&
+-                kbase_kmod_va_check(tex.surfaces, pan_size(SURFACE_WITH_STRIDE)) == 1) {
+-               pan_unpack((const struct mali_surface_with_stride_packed *)(uintptr_t)tex.surfaces,
+-                          SURFACE_WITH_STRIDE, surf);
+-               panvk_validate_addr("tex.surface0", job, i, surf.pointer, 1);
++            /* The hardware indexes the surface table by level, layer and cube face. */
++            unsigned faces = tex.dimension == MALI_TEXTURE_DIMENSION_CUBE ? 6 : 1;
++            unsigned nsurf = tex.levels * MAX2(tex.array_size, 1) * faces;
++            panvk_validate_addr("tex.surfaces", job, i, tex.surfaces,
++                                nsurf * pan_size(SURFACE_WITH_STRIDE));
++            if (tex.surfaces && nsurf < 4096 &&
++                kbase_kmod_va_check(tex.surfaces, nsurf * pan_size(SURFACE_WITH_STRIDE)) == 1) {
++               for (unsigned sidx = 0; sidx < nsurf; sidx++) {
++                  pan_unpack((const struct mali_surface_with_stride_packed *)(uintptr_t)(
++                                tex.surfaces + sidx * pan_size(SURFACE_WITH_STRIDE)),
++                             SURFACE_WITH_STRIDE, surf);
++                  if (kbase_kmod_va_check(surf.pointer, 1) == 0) {
++                     panvk_validate_addr("tex.surface", job, i * 1000 + sidx, surf.pointer, 1);
++                     mesa_loge("panvk validate:   texture %u: dim %u fmt 0x%x %ux%u levels %u "
++                               "array %u depth %u surfaces %u",
++                               i, tex.dimension, tex.format, tex.width, tex.height, tex.levels,
++                               tex.array_size, tex.depth, nsurf);
++                     break;
++                  }
++               }
+             }
+          }
+       }
+@@ -123,7 +138,26 @@ panvk_validate_draw(unsigned job, const void *draw_desc)
+          }
+          pan_unpack((const struct mali_attribute_buffer_packed *)(uintptr_t)bva, ATTRIBUTE_BUFFER, ab);
+          if (ab.type != MALI_ATTRIBUTE_TYPE_CONTINUATION && ab.size)
+-            panvk_validate_addr("attrib_buf", job, i, ab.pointer, 1);
++            panvk_validate_addr("attrib_buf", job, i, ab.pointer, ab.size);
++      }
++   }
++
++   panvk_validate_addr("position", job, 0, d.position, 1);
++   unsigned vary_count = rsd.shader.varying_count;
++   if (vary_count && d.varyings && d.varying_buffers &&
++       kbase_kmod_va_check(d.varyings, vary_count * pan_size(ATTRIBUTE)) == 1) {
++      for (unsigned i = 0; i < vary_count; i++) {
++         pan_unpack((const struct mali_attribute_packed *)(uintptr_t)(
++                       d.varyings + i * pan_size(ATTRIBUTE)),
++                    ATTRIBUTE, vary);
++         uint64_t bva = d.varying_buffers + vary.buffer_index * pan_size(ATTRIBUTE_BUFFER);
++         if (kbase_kmod_va_check(bva, pan_size(ATTRIBUTE_BUFFER)) != 1) {
++            panvk_validate_addr("varying_buf_desc", job, i, bva, pan_size(ATTRIBUTE_BUFFER));
++            continue;
++         }
++         pan_unpack((const struct mali_attribute_buffer_packed *)(uintptr_t)bva, ATTRIBUTE_BUFFER, vb);
++         if (vb.type != MALI_ATTRIBUTE_TYPE_CONTINUATION && vb.size)
++            panvk_validate_addr("varying_buf", job, i, vb.pointer, vb.size);
+       }
+    }
+ }
+@@ -165,6 +199,40 @@ panvk_validate_batch(struct panvk_batch *batch)
+          break;
+       }
+ #endif
++      case MALI_JOB_TYPE_FRAGMENT: {
++         pan_section_unpack(job, FRAGMENT_JOB, PAYLOAD, frag);
++         uint64_t fbd = frag.framebuffer & ~0x3full;
++         panvk_validate_addr("fbd", k, 0, fbd, 128);
++         if (!fbd || kbase_kmod_va_check(fbd, 128) != 1)
++            break;
++         pan_section_unpack((const void *)(uintptr_t)fbd, FRAMEBUFFER, PARAMETERS, fbp);
++         panvk_validate_addr("fbd.tiler", k, 0, fbp.tiler, 1);
++         panvk_validate_addr("fbd.sample_locations", k, 0, fbp.sample_locations, 1);
++         panvk_validate_addr("fbd.frame_shader_dcds", k, 0, fbp.frame_shader_dcds, 1);
++         if (fbp.frame_shader_dcds &&
++             kbase_kmod_va_check(fbp.frame_shader_dcds, 3 * pan_size(DRAW)) == 1) {
++            const enum mali_pre_post_frame_shader_mode modes[3] = {
++               fbp.pre_frame_0, fbp.pre_frame_1, fbp.post_frame};
++            for (unsigned i = 0; i < 3; i++) {
++               if (modes[i] != MALI_PRE_POST_FRAME_SHADER_MODE_NEVER)
++                  panvk_validate_draw(k, (const void *)(uintptr_t)(fbp.frame_shader_dcds +
++                                                                     i * pan_size(DRAW)));
++            }
++         }
++         /* ZS/CRC extension and render targets follow the 128-byte FBD: check every
++          * word that looks like a GPU address. */
++         unsigned words = (64 + fbp.render_target_count * 64) / 8;
++         uint64_t ext = fbd + 128;
++         if (kbase_kmod_va_check(ext, words * 8) == 1) {
++            const uint64_t *w64 = (const uint64_t *)(uintptr_t)ext;
++            for (unsigned i = 0; i < words; i++) {
++               uint64_t v = w64[i] & ~0x3full;
++               if (v >> 36 && !(v >> 40))
++                  panvk_validate_addr("fbd.rt_word", k, i, v, 1);
++            }
++         }
++         break;
++      }
+       default:
+          break;
+       }
+@@ -250,14 +318,133 @@ panvk_dump_words(const char *what, uint64_t va, unsigned count)
+                 w[i + 6], w[i + 7]);
+ }
+ 
++
++#if PAN_ARCH <= 7
++/* On a failed submission, dump the draws of the batch that stopped (its first job that never ran
++ * follows jobs that did): descriptors as text, shaders as raw binaries, next to the driver. */
++static void
++panvk_dump_fault_draws(struct panvk_batch *batch, unsigned b)
++{
++   static unsigned dumps;
++   if (dumps >= 3)
++      return;
++   dumps++;
++
++   Dl_info info;
++   if (!dladdr((void *)panvk_dump_fault_draws, &info) || !info.dli_fname)
++      return;
++   char dir[4096], path[4200];
++   snprintf(dir, sizeof(dir), "%s", info.dli_fname);
++   char *slash = strrchr(dir, '/');
++   if (slash)
++      *slash = 0;
++   snprintf(path, sizeof(path), "%s/draw-%d-%u.txt", dir, getpid(), dumps);
++   FILE *txt = fopen(path, "w");
++   snprintf(path, sizeof(path), "%s/draw-%d-%u.bin", dir, getpid(), dumps);
++   FILE *bin = fopen(path, "wb");
++   if (!txt || !bin) {
++      if (txt)
++         fclose(txt);
++      if (bin)
++         fclose(bin);
++      return;
++   }
++   fprintf(txt, "batch %u\n", b);
++
++   unsigned k = 0;
++   util_dynarray_foreach(&batch->jobs, void *, jobp) {
++      const uint8_t *job = *jobp;
++      const uint32_t *w = (const uint32_t *)job;
++      unsigned type = (w[4] >> 1) & 0x7f;
++      const void *draws[2] = {NULL, NULL};
++      if (type == MALI_JOB_TYPE_TILER)
++         draws[0] = pan_section_ptr(job, TILER_JOB, DRAW);
++      else if (type == MALI_JOB_TYPE_VERTEX || type == MALI_JOB_TYPE_COMPUTE)
++         draws[0] = pan_section_ptr(job, COMPUTE_JOB, DRAW);
++      else if (type == MALI_JOB_TYPE_INDEXED_VERTEX) {
++         draws[0] = pan_section_ptr(job, INDEXED_VERTEX_JOB, VERTEX_DRAW);
++         draws[1] = pan_section_ptr(job, INDEXED_VERTEX_JOB, FRAGMENT_DRAW);
++      }
++      fprintf(txt, "job %u type %u status 0x%x\n", k, type, w[0]);
++      for (unsigned di = 0; di < 2 && draws[di]; di++) {
++         const uint32_t *dw = draws[di];
++         fprintf(txt, " draw%u:", di);
++         for (unsigned i = 0; i < 32; i++)
++            fprintf(txt, " %08x", dw[i]);
++         fputc('\n', txt);
++         pan_unpack((const struct mali_draw_packed *)draws[di], DRAW, d);
++         if (!d.state || kbase_kmod_va_check(d.state, pan_size(RENDERER_STATE)) == 0)
++            continue;
++         const uint32_t *rw = (const uint32_t *)(uintptr_t)d.state;
++         fprintf(txt, "  rsd:");
++         for (unsigned i = 0; i < 16; i++)
++            fprintf(txt, " %08x", rw[i]);
++         fputc('\n', txt);
++         pan_unpack((const struct mali_renderer_state_packed *)(uintptr_t)d.state, RENDERER_STATE, rsd);
++         uint64_t sh = rsd.shader.shader & ~0xfull;
++         long off = ftell(bin);
++         size_t bsize = 0;
++         const void *code = kbase_kmod_shader_lookup(sh, &bsize);
++         if (code) {
++            fwrite(code, 1, bsize, bin);
++            fprintf(txt, "  shader 0x%" PRIx64 " -> bin offset %ld (%zu bytes)\n", sh, off, bsize);
++         } else {
++            fprintf(txt, "  shader 0x%" PRIx64 " not registered\n", sh);
++         }
++         unsigned ubos = rsd.properties.uniform_buffer_count;
++         if (ubos && d.uniform_buffers && kbase_kmod_va_check(d.uniform_buffers, ubos * 8) != 0) {
++            const uint64_t *u = (const uint64_t *)(uintptr_t)d.uniform_buffers;
++            fprintf(txt, "  ubos:");
++            for (unsigned i = 0; i < ubos; i++)
++               fprintf(txt, " %016" PRIx64, u[i]);
++            fputc('\n', txt);
++         }
++         if (d.push_uniforms && kbase_kmod_va_check(d.push_uniforms, 256) != 0) {
++            const uint32_t *pu = (const uint32_t *)(uintptr_t)d.push_uniforms;
++            fprintf(txt, "  push:");
++            for (unsigned i = 0; i < 64; i++)
++               fprintf(txt, " %08x", pu[i]);
++            fputc('\n', txt);
++         }
++      }
++      k++;
++   }
++   fclose(txt);
++   fclose(bin);
++   mesa_loge("panvk: dumped the draws of batch %u to %s", b, path);
++}
++#endif
++
+ static void
+ panvk_kbase_report_faults(struct panvk_device *dev, struct panvk_cmd_buffer *const *cmdbufs,
+                           unsigned nr_cmdbufs)
+ {
+    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+    unsigned b = 0;
++   bool seen_done = false, dumped = false;
++   unsigned first_b = UINT32_MAX;
+    for (uint32_t j = 0; j < nr_cmdbufs; ++j) {
+       list_for_each_entry(struct panvk_batch, batch, &cmdbufs[j]->batches, node) {
++#if PAN_ARCH <= 7
++         util_dynarray_foreach(&batch->jobs, void *, jp) {
++            const uint32_t st = ((const uint32_t *)*jp)[0];
++            if (st == 1)
++               seen_done = true;
++            else if (!dumped && seen_done && getenv("PANVK_VALIDATE")) {
++               panvk_dump_fault_draws(batch, b);
++               dumped = true;
++               first_b = b;
++            }
++         }
++         /* The batches after the first that stopped can run alongside it. */
++         if (dumped && b > first_b) {
++            static unsigned extra;
++            if (extra < 2 && getenv("PANVK_VALIDATE")) {
++               extra++;
++               panvk_dump_fault_draws(batch, b);
++            }
++         }
++#endif
+          unsigned k = 0;
+          util_dynarray_foreach(&batch->jobs, void *, job) {
+             const uint32_t *w = *job;
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index 8995982..b0cfd06 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -1156,8 +1156,11 @@ panvk_per_arch(CmdBindIndexBuffer2)(VkCommandBuffer commandBuffer,
+          VK_BUFFER_USAGE_2_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT |
+          VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT_KHR;
+       struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
++      static int no_cpu_scan = -1;
++      if (no_cpu_scan < 0)
++         no_cpu_scan = getenv("PANVK_NO_CPU_INDEX_SCAN") != NULL;
+       cmdbuf->state.gfx.ib.cpu_readable =
+-         PAN_ARCH < 10 && pan_kmod_dev_is_kbase(dev->kmod.dev) &&
++         !no_cpu_scan && PAN_ARCH < 10 && pan_kmod_dev_is_kbase(dev->kmod.dev) &&
+          cmdbuf->state.gfx.ib.dev_addr && !(buf->vk.usage & gpu_writes);
+    } else {
+       cmdbuf->state.gfx.ib.cpu_readable = false;
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 95e9a78..0f6f002 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -19,6 +19,7 @@
+ #include "panvk_nir.h"
+ #include "panvk_physical_device.h"
+ #include "panvk_sampler.h"
++#include "kmod/kbase_kmod.h"
+ #include "panvk_shader.h"
+ 
+ #include "spirv/nir_spirv.h"
+@@ -1517,6 +1518,8 @@ panvk_shader_upload(struct panvk_device *dev,
+       &dev->mempools.exec, shader->bin_ptr, shader->bin_size, 128);
+    if (!panvk_priv_mem_check_alloc(shader->code_mem))
+       return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   kbase_kmod_shader_register(panvk_priv_mem_dev_addr(shader->code_mem), shader->bin_ptr,
++                              shader->bin_size);
+ 
+ #if PAN_ARCH >= 9
+    /* The inline constant pool is addressed as PC plus a 32-bit offset */
+diff --git a/src/vulkan/runtime/vk_meta_copy_fill_update.c b/src/vulkan/runtime/vk_meta_copy_fill_update.c
+index 1614afa..a89747f 100644
+--- a/src/vulkan/runtime/vk_meta_copy_fill_update.c
++++ b/src/vulkan/runtime/vk_meta_copy_fill_update.c
+@@ -1145,6 +1145,11 @@ build_buffer_to_image_fs(const struct vk_meta_device *meta,
+ 
+    coords = nir_iadd(b, coords, img_offs);
+ 
++   /* A fragment before the copy's image offset gives negative coordinates, which the 32-bit
++    * buffer offset turns into a read ~4 GiB past the buffer (a GPU fault on Mali kbase). */
++   nir_terminate_if(b, nir_ior(b, nir_ilt_imm(b, nir_channel(b, coords, 0), 0),
++                               nir_ilt_imm(b, nir_channel(b, coords, 1), 0)));
++
+    nir_def *texel = nir_load_global(b,
+       comp_count, comp_sz, copy_img_buf_addr(b, buf_pfmt, coords),
+       .align_mul = 1 << (ffs(blk_sz) - 1));
+-- 
+2.43.0
+

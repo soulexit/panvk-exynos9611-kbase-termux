@@ -18,8 +18,32 @@ but has not been validated on the device.
 
 | Version | Date | Driver | L0 enumerate | L1 offscreen | L2 WSI | L3 app | Notes |
 |---|---|---|---|---|---|---|---|
+| v0.03 | 2026-10-28 | Mesa 27.0.0-devel, base `d896b0a` + 5 patches, kbase JM | **PASS** | **PASS** (compute + triangle) | **PASS** (Eden) | **PASS** Eden/Zelda: Echoes of Wisdom in-game; Winlator and ARMSX2 not re-tested | Eden gameplay |
 | v0.02 | 2026-10-26 | Mesa 27.0.0-devel, base `d896b0a` + 2 patches, kbase JM | **PASS** | **PASS** (compute + triangle) | **PASS** (Winlator, Eden, ARMSX2) | **PASS** ARMSX2/Kingdom Hearts; **PASS** Winlator DXVK D3D9 (NFS MW intro + title); Eden title/menus only | new base, Eden + DXVK fixes |
 | v0.01 | 2026-10-21 | Mesa 26.3.0-devel, base `fb3b49d`, kbase JM | **PASS** | **PASS** (compute + triangle) | **PASS** (Winlator compositor) | **PASS** (ARMSX2/Kingdom Hearts); Winlator DXVK pending | first debug build |
+
+### v0.03 details
+
+**L0/L1:** Termux `vulkaninfo` lists the Mali-G72 with `textureCompressionBC = true` and a 2.18 GiB
+heap (40% of RAM); the compute readback and the offscreen triangle pass.
+
+**Eden — The Legend of Zelda: Echoes of Wisdom (v1.1.0), Eden nightly, 1x, VRAM Conservative,
+GPU unswizzle off.** Save loaded at Suthorn Ruins:
+
+| Build / setting | Result |
+|---|---|
+| v0.02 | title + menus; gameplay black, GPU MMU faults |
+| + AFBC off, BC emulation off | HUD only, 3D world black; `INSTR_INVALID_ENC` (0x51) on compute |
+| + `WMASK`-free ballot (patch 0004) | **renders in-game**, 0 faults; 5–6 FPS, GPU 99% busy |
+| + AFBC on with zeroed headers (patch 0005) | 0 faults |
+| + BC emulation on | 0 faults, ~3 FPS, then killed by the low-memory killer (4.4 GB RSS + 640 MB swap) |
+| v0.03 defaults (AFBC on, BC emulation off for Eden, 40% heap) | **6.9 / 5.9 / 7.5 / 7.5 FPS over 40 s, 0 faults**, Eden reports 2.18 GiB VRAM, ~950 MB GPU memory |
+
+The faulting shader was found with the new tooling: the failed atom's chain gave a compute job
+with `status 0x51`, its fault address pointed into a registered shader, and the saved binary
+disassembled (host `bifrost` disassembler) to a clause using `WMASK.subgroup4`.
+
+Winlator and ARMSX2 were not re-tested on v0.03.
 
 ### v0.02 details
 

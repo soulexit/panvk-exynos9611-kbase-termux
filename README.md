@@ -79,8 +79,32 @@ Versioning is `v0.01`, `v0.02`, … for debug builds; a build only moves forward
 
 | Build | Date | Driver | Termux `vulkaninfo` | Winlator | ARMSX2 | Notes |
 |---|---|---|---|---|---|---|
+| v0.03 | 2026-10-28 | Mesa 27.0.0-devel + kbase JM + 5 local patches | **PASS** (L0 + L1 + offscreen) | not re-tested on this build | not re-tested on this build | **Eden: Zelda: Echoes of Wisdom in-game, 6–7.5 FPS, 0 GPU faults** |
 | v0.02 | 2026-10-26 | Mesa 27.0.0-devel + kbase JM + 2 local patches | **PASS** (L0 + L1 + offscreen) | **DXVK D3D9 PASS** — NFS Most Wanted intro/title/menu video at 50–60 FPS, 0 GPU faults | **PASS** — Kingdom Hearts, parity with v0.01 | New base; Eden reaches title + menus (gameplay still faults) |
 | v0.01 | 2026-10-21 | Mesa 26.3.0-devel + kbase JM | **PASS** (L0 + L1 + offscreen) | **swapchain PASS**, DXVK map failure | **PASS** — Kingdom Hearts native + 2x | First device build; see test log |
+
+### v0.03 changes
+
+- **Eden gameplay works.** Zelda: Echoes of Wisdom renders in-game (Suthorn Ruins) at a steady
+  6–7.5 FPS at 1x with no GPU fault and no low-memory kill. v0.02 stopped at the menus.
+- **G72 compiler fixes** (`patches/0004`, from the jm-v7 series written for a Galaxy S9, also a
+  Mali-G72): subgroup ballot/vote no longer emit `WMASK`, which v6 does not have
+  (`INSTR_INVALID_ENC` 0x51 on every such compute shader — this blacked out Eden's 3D world);
+  `read_invocation` uses the old `CLPER` encoding; texture offsets are packed with 32-bit shifts.
+- **AFBC headers are zeroed when memory is bound to an AFBC image** (`patches/0005`). A copy into
+  a never-written image preloads it, and the garbage headers sent the GPU up to 4 GiB away (MMU
+  faults, `JOB_READ_FAULT`).
+- **GPU heap = 40% of RAM on kbase** (was 75%), so apps that size caches from it (Eden reported
+  4 GiB of "VRAM") stop pushing a 6 GB phone into swap. `PANVK_HEAP_PERCENT` overrides.
+- **BC emulation is off by default in Switch emulators** (Eden, yuzu, Citron, Sudachi, Suyu,
+  Torzu, Strato/Skyline): they decode BC into a single copy themselves, and the emulation's extra
+  copy got Eden killed by the low-memory killer. Other apps keep `textureCompressionBC`;
+  `PANVK_NO_BC_EMU=0/1` decides when set.
+- **Robustness** (`patches/0003`): indexed indirect draws clamp `firstIndex`/`indexCount` to the
+  bound index buffer; the buffer-to-image copy shader drops fragments with negative coordinates.
+- **Fault tooling**: when any atom fails, the job that faulted is logged from its chain, and with
+  `PANVK_VALIDATE=1` the shader containing an instruction fault is saved next to the driver
+  (`badshader-*.bin`), as are the draws of the batch that stopped (`draw-*.txt/.bin`).
 
 ### v0.02 changes
 
@@ -140,9 +164,10 @@ full test log.
 - **Mali-G72 is v6, the least-tested Bifrost path.** The base tree validates G72 on a Tab S6 Lite;
   the A51's Android 16 + kbase r38 combination is new and may expose kernel/ABI differences.
 - **BCn is emulated** (decoded on the GPU into a carrier format); `PANVK_NO_BC_EMU=1` turns it off.
-- **Eden gameplay faults.** Zelda: Echoes of Wisdom reaches the title screen and menus; loading a
-  save hits GPU translation faults (under investigation). Eden's *GPU unswizzle* option corrupts
-  textures on this driver — turn it off.
+- **Eden is slow and memory-bound.** Zelda: Echoes of Wisdom runs at 6–7.5 FPS at 1x; Eden's
+  emulated RAM plus its GPU memory fill a 6 GB phone. Eden's *GPU unswizzle* option corrupted
+  textures with earlier builds — keep it off.
+- **v0.03 was not re-tested in Winlator or ARMSX2** (the AFBC and heap changes affect them).
 - **No D3D12 / vkd3d-proton path.** That needs features this driver does not provide yet.
 - **GS/tessellation/XFB are compute-emulated**, so they are slow on a 3-core G72.
 - **4–6 GB shared RAM.** GPU allocations come out of the same memory as Android and Wine.
@@ -154,7 +179,7 @@ full test log.
 
 ```text
 README.md                  this file
-VERSION                    current debug build number (0.02)
+VERSION                    current debug build number (0.03)
 NOTICE.md                  attribution and licensing
 profiles/                  device/kbase profile (JSON)
 patches/                   local patch series on top of the pinned base commit
@@ -268,9 +293,9 @@ From a release zip:
 
 ```sh
 cd ~
-curl -LO https://github.com/soulexit/panvk-exynos9611-kbase-termux/releases/download/v0.02/panvk-exynos9611-termux-v0.02.zip
-unzip -o panvk-exynos9611-termux-v0.02.zip -d panvk-v002
-bash panvk-v002/install-termux.sh
+curl -LO https://github.com/soulexit/panvk-exynos9611-kbase-termux/releases/download/v0.03/panvk-exynos9611-termux-v0.03.zip
+unzip -o panvk-exynos9611-termux-v0.03.zip -d panvk-v003
+bash panvk-v003/install-termux.sh
 ```
 
 From a local build:

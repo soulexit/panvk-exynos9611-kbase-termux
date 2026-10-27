@@ -1,0 +1,171 @@
+From 91dd9cdceb8d384a8907e364f58998a2e7ce62df Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Wed, 28 Oct 2026 01:02:01 +0300
+Subject: [PATCH 5/5] panvk: AFBC header init, phone-sized heap, no BC
+ emulation for Switch emulators
+
+- Zero the AFBC headers of an image when ordinary memory is bound to it.
+  Garbage headers made preloads (copies into a never-written image) follow
+  random body offsets up to 4 GiB away: GPU MMU faults in Eden gameplay.
+- Report 40% of RAM as the GPU heap on kbase (Android) instead of 75%:
+  Eden sized its texture cache for 4 GiB of VRAM on a 6 GB phone and
+  thrashed swap. PANVK_HEAP_PERCENT overrides.
+- Turn BC emulation off by default in Switch emulators (Eden, yuzu, Citron,
+  Sudachi, Suyu, Torzu, Strato/Skyline), which decode BC into one copy
+  themselves; the compressed + carrier copies got Eden killed by the LMK.
+  PANVK_NO_BC_EMU=0/1 still decides when set.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_bc_emu.c          | 32 ++++++++++++-
+ src/panfrost/vulkan/panvk_image.c           | 50 +++++++++++++++++++++
+ src/panfrost/vulkan/panvk_physical_device.c | 13 +++++-
+ 3 files changed, 92 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_bc_emu.c b/src/panfrost/vulkan/panvk_bc_emu.c
+index e3ade01..5d5dd19 100644
+--- a/src/panfrost/vulkan/panvk_bc_emu.c
++++ b/src/panfrost/vulkan/panvk_bc_emu.c
+@@ -76,6 +76,36 @@ static const uint32_t bc_emu_eac_r_3d_spv[] = {
+ 
+ DEBUG_GET_ONCE_BOOL_OPTION(no_bc_emu, "PANVK_NO_BC_EMU", false)
+ 
++/* Switch emulators decode BC themselves when the device lacks it, into one copy; the emulation
++ * here keeps the compressed image and a decoded carrier, and Zelda: Echoes of Wisdom in Eden on
++ * a 6 GB Galaxy A51 went from 4.3 GB to 4.4 GB + 640 MB of swap and was killed by the
++ * low-memory killer. Off by default for them; PANVK_NO_BC_EMU=0/1 decides when set. */
++static bool
++bc_emu_disabled(void)
++{
++   if (os_get_option("PANVK_NO_BC_EMU"))
++      return debug_get_option_no_bc_emu();
++
++   static int switch_emu = -1;
++   if (switch_emu < 0) {
++      switch_emu = 0;
++      char name[256] = {0};
++      FILE *f = fopen("/proc/self/cmdline", "r");
++      if (f) {
++         size_t n = fread(name, 1, sizeof(name) - 1, f);
++         name[n] = 0;
++         fclose(f);
++      }
++      static const char *const emus[] = {"eden", "yuzu", "citron", "sudachi", "suyu",
++                                         "torzu", "strato", "skyline"};
++      for (unsigned i = 0; i < ARRAY_SIZE(emus); i++) {
++         if (strstr(name, emus[i]))
++            switch_emu = 1;
++      }
++   }
++   return switch_emu;
++}
++
+ /* TEXTURE_FEATURES_0 bits, the compressed format ids of the v6/v7 genxml: EAC R11 UNORM 2,
+  * EAC RG11 UNORM 4, BC1..BC3 7..9, BC4_UNORM..BC7 10..16, ASTC 2D LDR 22. */
+ #define TF_BC13 (0x7u << 7)
+@@ -95,7 +125,7 @@ enum panvk_bc_emu_profile
+ panvk_bc_emu_profile(const struct panvk_physical_device *pdev)
+ {
+    const unsigned arch = pan_arch(pdev->kmod.dev->props.gpu_id);
+-   if (arch < 6 || arch > 7 || debug_get_option_no_bc_emu())
++   if (arch < 6 || arch > 7 || bc_emu_disabled())
+       return PANVK_BC_EMU_NONE;
+ 
+    const uint32_t tf = pan_query_compressed_formats(&pdev->kmod.dev->props);
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index 0d0557d..f4f979d 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -682,6 +682,55 @@ panvk_image_init(struct panvk_image *image,
+    return panvk_image_init_layouts(image, pCreateInfo);
+ }
+ 
++/* AFBC headers of an image nobody has written yet are whatever the memory held, and each holds
++ * a 32-bit offset to its block's body. A load of such an image (a copy into it, which preloads
++ * the tile buffer from the image) makes the GPU follow those offsets anywhere within 4 GiB of the
++ * header: on kbase, an MMU fault that kills the job chain. An all-zero header is a solid
++ * transparent-black block, so zero them when the memory is bound. Imported memory keeps what its
++ * producer wrote. */
++static void
++panvk_image_plane_zero_afbc_headers(struct panvk_image_plane *plane,
++                                    struct panvk_device_memory *mem, uint64_t offset)
++{
++   const struct pan_image_props *props = &plane->image.props;
++   const struct pan_image_layout *layout = &plane->plane.layout;
++
++   if (!drm_is_afbc(props->modifier) || (mem->bo->flags & PAN_KMOD_BO_FLAG_IMPORTED))
++      return;
++
++   bool temporary_map = mem->addr.host == NULL;
++   uint8_t *cpu_map = temporary_map
++                         ? pan_kmod_bo_mmap(mem->bo, PROT_READ | PROT_WRITE, MAP_SHARED, NULL)
++                         : mem->addr.host;
++   if (cpu_map == 0 || cpu_map == MAP_FAILED)
++      return;
++
++   const unsigned layers = MAX2(props->array_size, 1);
++   for (unsigned l = 0; l < props->nr_slices; l++) {
++      const struct pan_image_slice_layout *slice = &layout->slices[l];
++      const unsigned depth = props->dim == MALI_TEXTURE_DIMENSION_3D
++                                ? MAX2(props->extent_px.depth >> l, 1)
++                                : 1;
++      for (unsigned a = 0; a < layers; a++) {
++         for (unsigned z = 0; z < depth; z++) {
++            uint64_t hdr = offset + slice->offset_B + a * layout->array_stride_B +
++                           z * slice->afbc.surface_stride_B;
++            uint32_t size = slice->afbc.header.surface_size_B;
++            if (hdr + size > pan_kmod_bo_size(mem->bo))
++               continue;
++            memset(cpu_map + hdr, 0, size);
++            pan_kmod_queue_bo_map_sync(mem->bo, hdr, cpu_map + hdr, size,
++                                       PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH);
++         }
++      }
++   }
++
++   if (temporary_map) {
++      ASSERTED int ret = os_munmap(cpu_map, pan_kmod_bo_size(mem->bo));
++      assert(!ret);
++   }
++}
++
+ static void
+ panvk_image_plane_bind_mem(struct panvk_device *dev,
+                            struct panvk_image_plane *plane,
+@@ -690,6 +739,7 @@ panvk_image_plane_bind_mem(struct panvk_device *dev,
+    plane->plane.base = mem->addr.dev + offset;
+    plane->mem = mem;
+    plane->mem_offset = offset;
++   panvk_image_plane_zero_afbc_headers(plane, mem, offset);
+    /* Zero-initialize CRC state. If CRC state is not mapped on the host, do a
+     * temporary mapping just for this operation. */
+    if (plane->image.props.crc) {
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index f653a0e..b4ec2f5 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -235,9 +235,18 @@ get_device_heaps(struct panvk_physical_device *device,
+    int host_coherent_not_cached_idx = -1;
+    int host_cached_not_coherent_idx = -1;
+ 
++   /* On Android/kbase the GPU heap is the same RAM the system, the app and (for emulators) the
++    * guest's memory live in. 75% of a 6 GB phone made Eden size its texture cache for 4 GiB of
++    * "VRAM" and push the phone into swap. Default to 40% there; PANVK_HEAP_PERCENT overrides. */
++   float heap_percent = instance->drirc.misc.heap_memory_percent;
++   const char *percent_env = os_get_option("PANVK_HEAP_PERCENT");
++   if (percent_env)
++      heap_percent = CLAMP(strtof(percent_env, NULL) / 100.0f, 0.05f, 1.0f);
++   else if (heap_percent == OS_GPU_HEAP_SIZE_HEURISTIC &&
++            pan_kmod_dev_is_kbase(device->kmod.dev))
++      heap_percent = 0.40f;
+    const uint64_t heap_size =
+-      os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent,
+-                           &instance->drirc.misc.heap_memory_percent);
++      os_get_gpu_heap_size(heap_percent, &instance->drirc.misc.heap_memory_percent);
+ 
+    device->memory.heap_count = 1;
+    device->memory.heaps[0] = (VkMemoryHeap){
+-- 
+2.43.0
+

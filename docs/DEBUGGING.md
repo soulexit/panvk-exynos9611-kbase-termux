@@ -27,7 +27,10 @@ Run `scripts/collect-logs.sh` to bundle all of it.
 | `MESA_LOG=stderr` | Mesa logs to stderr instead of logcat |
 | `MESA_SHADER_CACHE_DISABLE=1` | Disable the on-disk shader cache |
 | `MESA_SHADER_CACHE_DIR=/tmp/panvk-cache` | Use a writable cache directory |
-| `PANVK_NO_BC_EMU=1` | Turn off BCn emulation (the app decodes BC itself, if it can) |
+| `PANVK_NO_BC_EMU=0/1` | Force BCn emulation on/off. Default: on, except in Switch emulators (v0.03+) |
+| `PANVK_HEAP_PERCENT=<n>` | Report n% of RAM as the GPU heap (default 40 on kbase, v0.03+) |
+| `PANVK_KBASE_NO_DEFER=1` | Free BOs immediately instead of after open submissions (bisecting) |
+| `PANVK_NO_CPU_INDEX_SCAN=1` | Never read index buffers on the CPU for direct indexed draws (bisecting) |
 | `PANVK_FORCE_ROBUST=1` | Bounds-check every UBO/SSBO access (v0.02+) |
 | `PANVK_VALIDATE=1` | Check every descriptor address of a job against the live BOs before it is submitted; record BO frees; on the first failed submission write `fault-<pid>.txt` (memory map + free history) next to the driver (v0.02+) |
 | `PANVK_KBASE_GROW_COMMIT_MB=<n>` | Commit `n` MB of the grow-on-fault heaps up front (v0.02+) |
@@ -46,6 +49,15 @@ D=/data/data/dev.eden.eden_emulator.nightly/files/gpu_driver      # Eden
 echo PANVK_VALIDATE=1 > $D/panvk.env
 chown $(stat -c %u:%g $D) $D/panvk.env && chcon $(stat -c %C $D) $D/panvk.env
 ```
+
+### Finding a faulting shader (v0.03+)
+
+With `PANVK_VALIDATE=1`, every uploaded shader is registered. When an atom fails, the driver walks
+its job chain and logs `kbase: atom N (code C) job … type T status S fault F`; for an instruction
+fault (`0x50`–`0x57`) the address is decoded and the containing shader is written to
+`badshader-<pid>-<n>.bin` next to the driver, with the fault offset in the log. Disassemble it on
+the build host with the Bifrost disassembler (`disassemble_bifrost()` from
+`build-host/src/panfrost/compiler/bifrost/libpanfrost_bifrost_disasm.a`).
 
 ### Reading a GPU fault (v0.02+)
 
