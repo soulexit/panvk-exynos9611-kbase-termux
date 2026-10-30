@@ -83,7 +83,7 @@ Tested:      as 0003
 Validation:  Eden 6-7.5 FPS steady, 0 faults, no LMK kill
 ```
 
-## 0006–0016: Vulkan CTS fixes (unreleased)
+## 0006–0017: Vulkan CTS fixes (unreleased)
 
 Found by running the Khronos CTS per advertised extension on the phone (`tools/cts`,
 `docs/CTS-RESULTS.md`). Every patch: Mali-G72 MP3 r0p1 (0x6221), kbase r38p1, Linux 4.14.364,
@@ -183,4 +183,16 @@ Symptom:     draws into a layered framebuffer landed on every layer; empty-VS ge
              were skipped
 Validation:  geometry.layered 100 -> 8 failures; no regressions over 2,240 renderpass, clear,
              copy/blit, multiview, dynamic rendering and transform feedback cases
+```
+
+### 0017 — Multisampled render to single-sampled AHB images; D32_S8 resolves
+
+```text
+Purpose:     create the multisampled images of an imported AHardwareBuffer image when it is
+             initialized from the AHB, each with memory of its own; no direct depth resolve to a
+             view without a depth plane
+Symptom:     SIGSEGV (NULL view) in CmdBeginRendering for msrtss AHB attachments and 8x D32_S8
+             depth resolves
+Validation:  0 crashes over 4,291 msrtss / depth_stencil_resolve / external_memory /
+             image_compression_control / device_memory_report cases (27 before)
 ```

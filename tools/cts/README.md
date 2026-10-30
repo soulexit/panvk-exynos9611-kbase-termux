@@ -23,6 +23,10 @@ $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
 
 Without the explicit `DE_OS`/`DE_CPU` flags the build detects the host (Unix/x86-64).
 
+Build for `android-34` / `DE_ANDROID_API=34` (as above with those two changed) to run the
+`android_hardware_buffer` cases: an API 31 build aborts in the CTS's own AHB helper on Android 13
+and newer, which shows up as a crash of every such case.
+
 ## Install (in Termux)
 
 - `~/cts/deqp-vk` and the CTS data (`external/vulkancts/data/vulkan` → `~/cts/vulkan`).

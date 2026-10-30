@@ -14,11 +14,16 @@ are **Fail** and **Crash**.
 |---|---:|---:|---:|---:|
 | v0.03 + 0006–0009 (first full run) | 32,556 | 816 | 147 | 3 |
 | mali-panvk `4570467` (patches 0001–0016) | **33,218** | **100** | 147 | 3 |
+| + patch 0017, deqp-vk for API 34 (the 147 crash cases re-run) | 113 of 147 pass / NotSupported | 7 | **0** | — |
 
-**134 of the 147 crashes are not the driver.** The `android_hardware_buffer` cases
-(`api.external.memory`, `image_compression_control`, `multisampled_render_to_single_sampled`)
-abort in the CTS itself: a deqp-vk built for API 31 asserts when it runs on Android 13 or newer
-(`vktExternalMemoryAndroidHardwareBufferUtil.cpp:87`). They need a deqp-vk built for API 34.
+**The 147 crashes, re-run with a deqp-vk built for API 34:** 113 were the CTS itself, not the
+driver: an API 31 build aborts in its own `android_hardware_buffer` helper on Android 13 and
+newer (`vktExternalMemoryAndroidHardwareBufferUtil.cpp:87`). Built for API 34 they pass or report
+NotSupported. The other 27 were driver crashes (rendering to multisampled-render-to-single-sampled
+AHB images, 8x D32_S8 depth resolves) and are fixed by patch 0017: **0 crashes** over the
+`multisampled_render_to_single_sampled`, `depth_stencil_resolve`, `external_memory`,
+`image_compression_control` and `device_memory_report` lists (4,291 cases). 7 AHB cases still
+fail (RGBA16F AHB format features, RGB888 AHB import, a memory-report object id).
 
 ## Known failures
 

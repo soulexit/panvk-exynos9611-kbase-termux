@@ -1,0 +1,175 @@
+From df5c7edf2617a1e5685a8e440272b13467a8ae75 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 30 Oct 2026 10:10:29 +0300
+Subject: [PATCH] panvk: multisampled-render-to-single-sampled on AHB images,
+ D32S8 resolves
+
+- An imported AHardwareBuffer has no room after the image for the
+  multisampled images of VK_EXT_multisampled_render_to_single_sampled,
+  and the deferred AHB init never created them: rendering to one
+  dereferenced a NULL view. Create them when the image is initialized
+  from the AHB, each with memory of its own.
+- A depth resolve to a view without a depth plane read through NULL in
+  avoid_direct_resolve_to; take the non-direct path.
+
+With a deqp-vk built for API 34 (the API 31 build aborts in its own AHB
+helper on Android 13+): 0 crashes over the multisampled_render_to_single_
+sampled, depth_stencil_resolve, external_memory and image_compression_
+control lists (4,291 cases), 27 before.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_android.c     |  9 ++++
+ src/panfrost/vulkan/panvk_image.c       | 57 ++++++++++++++++++++++++-
+ src/panfrost/vulkan/panvk_image.h       |  8 ++++
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c |  5 +++
+ 4 files changed, 77 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_android.c b/src/panfrost/vulkan/panvk_android.c
+index 404e272..5f30af1 100644
+--- a/src/panfrost/vulkan/panvk_android.c
++++ b/src/panfrost/vulkan/panvk_android.c
+@@ -255,6 +255,15 @@ panvk_android_ahb_image_init(struct AHardwareBuffer *ahb,
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   if (img->vk.create_flags & VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT &&
++       img->vk.format != VK_FORMAT_UNDEFINED) {
++      struct panvk_device *dev = to_panvk_device(img->vk.base.device);
++      result = panvk_image_create_owned_ms_images(dev, img,
++                                                  img->vk.android_deferred_create_info);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
+    return VK_SUCCESS;
+ }
+ 
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index f4f979d..0fe2b33 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -824,6 +824,56 @@ create_ms_images(struct panvk_device *dev, struct panvk_image *img,
+    }
+ }
+ 
++static VkResult panvk_image_bind(struct panvk_device *dev,
++                                 const VkBindImageMemoryInfo *bind_info);
++
++/* The multisampled images of VK_EXT_multisampled_render_to_single_sampled, for an image whose
++ * memory is imported whole (an AHardwareBuffer): each is created without the import's pNext and
++ * bound to an allocation of its own. */
++VkResult
++panvk_image_create_owned_ms_images(struct panvk_device *dev, struct panvk_image *img,
++                                   const VkImageCreateInfo *pCreateInfo)
++{
++   VkDevice device = panvk_device_to_handle(dev);
++   VkImageCreateInfo plain = *pCreateInfo;
++   plain.pNext = NULL;
++   plain.tiling = VK_IMAGE_TILING_OPTIMAL;
++   create_ms_images(dev, img, &plain, NULL);
++   img->ms_owned = true;
++
++   for (uint32_t i = 0; i < ARRAY_SIZE(img->ms_imgs); i++) {
++      if (img->ms_imgs[i] == VK_NULL_HANDLE)
++         continue;
++
++      const VkImageMemoryRequirementsInfo2 reqs_info = {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
++         .image = img->ms_imgs[i],
++      };
++      VkMemoryRequirements2 reqs2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
++      panvk_GetImageMemoryRequirements2(device, &reqs_info, &reqs2);
++      const VkMemoryRequirements reqs = reqs2.memoryRequirements;
++      const VkMemoryAllocateInfo alloc = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++         .allocationSize = reqs.size,
++         .memoryTypeIndex = ffs(reqs.memoryTypeBits) - 1,
++      };
++      VkResult result =
++         dev->vk.dispatch_table.AllocateMemory(device, &alloc, NULL, &img->ms_mem[i]);
++      if (result != VK_SUCCESS)
++         return result;
++
++      const VkBindImageMemoryInfo bind = {
++         .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
++         .image = img->ms_imgs[i],
++         .memory = img->ms_mem[i],
++      };
++      result = panvk_image_bind(dev, &bind);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++   return VK_SUCCESS;
++}
++
+ /* See Vulkan spec, 35.4.3. Standard Sparse Image Block Shapes for details */
+ enum {
+    STANDARD_SPARSE_BLOCK_SIZE_B = 65536,
+@@ -958,7 +1008,9 @@ panvk_DestroyImage(VkDevice _device, VkImage _image,
+    if (image->vk.create_flags &
+        VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+       for (uint32_t i = 0; i < ARRAY_SIZE(image->ms_imgs); ++i) {
+-         panvk_DestroyImage(_device, image->ms_imgs[i], pAllocator);
++         panvk_DestroyImage(_device, image->ms_imgs[i], image->ms_owned ? NULL : pAllocator);
++         if (image->ms_mem[i] != VK_NULL_HANDLE)
++            device->vk.dispatch_table.FreeMemory(_device, image->ms_mem[i], NULL);
+       }
+    }
+ 
+@@ -1495,7 +1547,8 @@ panvk_image_bind(struct panvk_device *dev,
+    }
+ 
+    if (!!(image->vk.create_flags &
+-          VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT))
++          VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) &&
++       !image->ms_owned)
+       bind_ms_images(dev, bind_info);
+ 
+    if (image->bc_emu.linear_sampled)
+diff --git a/src/panfrost/vulkan/panvk_image.h b/src/panfrost/vulkan/panvk_image.h
+index b450618..c18c208 100644
+--- a/src/panfrost/vulkan/panvk_image.h
++++ b/src/panfrost/vulkan/panvk_image.h
+@@ -45,6 +45,10 @@ struct panvk_image {
+ 
+    /* One image each for 2x 4x 8x 16x. We don't support more than 16x. */
+    VkImage ms_imgs[4];
++   /* An imported AHardwareBuffer has no room after the image for those: they get memory of their
++    * own (panvk_image_create_owned_ms_images). */
++   VkDeviceMemory ms_mem[4];
++   bool ms_owned;
+ 
+    /* If an image can track validity of CRC even when external access is
+     * possible. */
+@@ -161,6 +165,10 @@ panvk_image_stencil_only_pfmt(const struct panvk_image *image)
+       image->planes[image->plane_count - 1].image.props.format);
+ }
+ 
++struct panvk_device;
++VkResult panvk_image_create_owned_ms_images(struct panvk_device *dev, struct panvk_image *img,
++                                            const VkImageCreateInfo *pCreateInfo);
++
+ VkResult panvk_image_init(struct panvk_image *image,
+                           const VkImageCreateInfo *pCreateInfo);
+ 
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index 9beacce..79f583d 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -118,6 +118,11 @@ avoid_direct_resolve_to(const struct pan_image *img)
+     * framebuffer layout and we could potentially allow direct resolves in
+     * more cases.
+     */
++   /* A view without that plane (a stencil-only view of a D32_S8 resolve target, which keeps
++    * depth and stencil apart): no direct resolve either. */
++   if (!img)
++      return true;
++
+    return PAN_ARCH < 7 && drm_is_afbc(img->props.modifier);
+ }
+ 
+-- 
+2.43.0
+
