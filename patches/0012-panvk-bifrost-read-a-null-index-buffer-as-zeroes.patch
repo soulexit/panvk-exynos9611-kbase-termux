@@ -1,0 +1,44 @@
+From 63ed01cd740e585b2cfb3b9e4e179d2e923c044d Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 30 Oct 2026 02:31:37 +0300
+Subject: [PATCH 12/16] panvk/bifrost: read a null index buffer as zeroes
+
+With maintenance6 and nullDescriptor a null index buffer supplies zero
+indices. Bifrost has no index buffer size to rely on, and address 0
+read-faults, so point it at the null descriptors' 4 KiB of zeroes and
+let the draw clamp the index count to that.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index b0cfd06..9beacce 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -1169,7 +1169,20 @@ panvk_per_arch(CmdBindIndexBuffer2)(VkCommandBuffer commandBuffer,
+        * on out-of-bounds behavior against the zero size of the buffer. Note
+        * that this only works for v10+, as v9 does not have a way to specify the
+        * index buffer size. */
++#if PAN_ARCH < 9
++      /* Bifrost: the null descriptors' 4 KiB of zeroes, so the indices a null buffer has to
++       * supply read as zero (VK_KHR_maintenance6), as many as fit in it: the draw clamps the
++       * index count to the buffer size. */
++      struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
++      if (dev->null_descs.valid) {
++         cmdbuf->state.gfx.ib.dev_addr = dev->null_descs.zero_addr;
++         cmdbuf->state.gfx.ib.size = 4096;
++      } else {
++         cmdbuf->state.gfx.ib.dev_addr = 0;
++      }
++#else
+       cmdbuf->state.gfx.ib.dev_addr = PAN_ARCH >= 10 ? 0x1000 : 0;
++#endif
+    }
+    cmdbuf->state.gfx.ib.index_size = vk_index_type_to_bytes(indexType);
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,93 @@
+From 5d83a72d748cf81f53b9cac49000e38ec595f6bd Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 30 Oct 2026 00:48:28 +0300
+Subject: [PATCH 08/16] panvk: only offer dma-buf import for external memory on
+ kbase
+
+kbase memory cannot be exported (kbase_kmod_bo_export), yet opaque fd
+and dma-buf export were advertised, so getMemoryFdKHR failed with
+OUT_OF_DEVICE_MEMORY and the cross_instance/signal_order CTS groups
+crashed. Report dma-buf as import-only and opaque fd as unsupported.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_physical_device.c | 27 +++++++++++++++------
+ 1 file changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index b4ec2f5..e989494 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1523,9 +1523,13 @@ panvk_get_external_image_format_properties(
+    VkExternalMemoryHandleTypeFlagBits handleType,
+    VkExternalMemoryProperties *external_properties)
+ {
++   /* kbase memory has no fd to export (kbase_kmod_bo_export), so on kbase only dma-buf
++    * import is offered: an opaque fd has no use without export. */
++   const bool kbase = pan_kmod_dev_is_kbase(physical_device->kmod.dev);
+    const VkExternalMemoryHandleTypeFlags supported_handle_types =
+-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++      kbase ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
++            : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
++                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+ 
+    if (!(handleType & supported_handle_types)) {
+       return panvk_errorf(physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED,
+@@ -1556,6 +1560,8 @@ panvk_get_external_image_format_properties(
+    } else if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR) {
+       features |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+    }
++   if (kbase)
++      features &= ~VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+ 
+    if (!features) {
+       return panvk_errorf(
+@@ -1566,7 +1572,7 @@ panvk_get_external_image_format_properties(
+ 
+    *external_properties = (VkExternalMemoryProperties){
+       .externalMemoryFeatures = features,
+-      .exportFromImportedHandleTypes = supported_handle_types,
++      .exportFromImportedHandleTypes = kbase ? 0 : supported_handle_types,
+       .compatibleHandleTypes = supported_handle_types,
+    };
+ 
+@@ -1870,9 +1876,13 @@ panvk_GetPhysicalDeviceExternalBufferProperties(
+       return;
+    }
+ 
++   VK_FROM_HANDLE(panvk_physical_device, physical_device, physicalDevice);
++   /* kbase: dma-buf import only, as for images. */
++   const bool kbase = pan_kmod_dev_is_kbase(physical_device->kmod.dev);
+    const VkExternalMemoryHandleTypeFlags supported_handle_types =
+-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++      kbase ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
++            : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
++                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+ 
+    /* From the Vulkan 1.3.298 spec:
+     *
+@@ -1883,14 +1893,15 @@ panvk_GetPhysicalDeviceExternalBufferProperties(
+    VkExternalMemoryFeatureFlags features = 0;
+    if (pExternalBufferInfo->handleType & supported_handle_types) {
+       handle_types |= supported_handle_types;
+-      features |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+-                  VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
++      features |= VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
++      if (!kbase)
++         features |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+    }
+ 
+    pExternalBufferProperties->externalMemoryProperties =
+       (VkExternalMemoryProperties){
+          .externalMemoryFeatures = features,
+-         .exportFromImportedHandleTypes = handle_types,
++         .exportFromImportedHandleTypes = kbase ? 0 : handle_types,
+          .compatibleHandleTypes = handle_types,
+       };
+ }
+-- 
+2.43.0
+

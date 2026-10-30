@@ -1,0 +1,72 @@
+From 2265e39e1325fc5cc0ca98c3b717a56859db7ce0 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 30 Oct 2026 02:55:45 +0300
+Subject: [PATCH 15/16] panvk/jm: survive geometry shaders that emit nothing
+
+A geometry shader declared with max_vertices 0 left an index count of 0,
+which the tiler stores minus one: the job ended TERMINATED. Give it one
+index, an incomplete primitive.
+
+Also keep the fault dumper from reading a wrapped address when a job
+reports fault address 0 (it segfaulted the process).
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c  | 6 +++++-
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 8 ++++++--
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 51a497f..fa39a3a 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -653,6 +653,10 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
+          panvk_cmd_alloc_dev_mem(cmdbuf, desc, MAX2(out_indices, 1) * 4, 4);
+       if (!idx.gpu)
+          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      /* A shader that can emit nothing (max_vertices 0) still gets a tiler job, whose index
++       * count is stored minus one: give it one index, an incomplete primitive. */
++      if (!out_indices)
++         *(uint32_t *)idx.cpu = 0;
+ 
+       draw->gs_varying_bufs = gs_bufs.gpu;
+       panvk_note_path("geometry shader emulation");
+@@ -1281,7 +1285,7 @@ panvk_emit_tiler_primitive(struct panvk_cmd_buffer *cmdbuf,
+        * filled in. The counts are the worst-case ones fixed at record time. */
+       if (draw->gs_varying_bufs && !cmdbuf->state.gfx.gs.posonly) {
+          cfg.index_type = MALI_INDEX_TYPE_UINT32;
+-         cfg.index_count = cmdbuf->state.gfx.gs.out_index_count;
++         cfg.index_count = MAX2(cmdbuf->state.gfx.gs.out_index_count, 1);
+          cfg.indices = cmdbuf->state.gfx.gs.out_index;
+          cfg.base_vertex_offset = 0;
+       } else if (!is_indirect_draw(draw) && draw->info.index.index_size) {
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 5feb135..dc5bdf2 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -283,6 +283,8 @@ panvk_queue_prepare_batch(struct panvk_device *dev, struct panvk_cmd_buffer *cmd
+ static bool
+ panvk_peek(uint64_t va, void *dst, size_t size)
+ {
++   if (va + size < va)
++      return false;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f)
+       return false;
+@@ -506,8 +508,10 @@ panvk_kbase_report_faults(struct panvk_device *dev, struct panvk_cmd_buffer *con
+             if (w[0] > 1) {
+                uint64_t fault = (uint64_t)w[2] | ((uint64_t)w[3] << 32);
+                panvk_dump_words("job", (uint64_t)(uintptr_t)*job, 64);
+-               panvk_dump_words("fault", (fault & ~0xffull) - 0x40, 64);
+-               panvk_dump_words("fault+", (fault & ~0xffull) + 0xc0, 64);
++               if (fault >= 0x100) {
++                  panvk_dump_words("fault", (fault & ~0xffull) - 0x40, 64);
++                  panvk_dump_words("fault+", (fault & ~0xffull) + 0xc0, 64);
++               }
+                /* Pointers in the job payload, to see what the fault address belongs to. */
+                for (unsigned i = 8; i < 62; i += 2) {
+                   uint64_t ptr = ((uint64_t)w[i] | ((uint64_t)w[i + 1] << 32)) & ~0x3full;
+-- 
+2.43.0
+

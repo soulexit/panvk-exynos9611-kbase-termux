@@ -1,0 +1,30 @@
+From d3b9869d99ecc533a80faf9724fe97b8c0731bdb Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 30 Oct 2026 00:42:13 +0300
+Subject: [PATCH 06/16] panfrost: fix A4R4G4B4 swizzle on v6
+
+The v6 swizzle for RGBA4 was the inverse of the one needed for
+VK_FORMAT_B4G4R4A4_UNORM_PACK16; GBAR maps to the ARGB order on v7.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/lib/pan_format.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/panfrost/lib/pan_format.c b/src/panfrost/lib/pan_format.c
+index 0bf7bd2..0eb751c 100644
+--- a/src/panfrost/lib/pan_format.c
++++ b/src/panfrost/lib/pan_format.c
+@@ -495,7 +495,7 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
+    FMT(R16G16B16_UINT,          RGB16UI,         RGB1, L, V_____),
+    FMT(R4G4B4A4_UNORM,          RGBA4_UNORM,     RGBA, L, VTR___),
+    FMT(B4G4R4A4_UNORM,          RGBA4_UNORM,     BGRA, L, VTR___),
+-   FMT(A4R4G4B4_UNORM,          RGBA4_UNORM,     ARGB, L, VTR___),
++   FMT(A4R4G4B4_UNORM,          RGBA4_UNORM,     GBAR, L, VTR___),
+    FMT(A4B4G4R4_UNORM,          RGBA4_UNORM,     ABGR, L, VTR___),
+    FMT(R16G16B16A16_UNORM,      RGBA16_UNORM,    RGBA, L, VTR_IB),
+ #if PAN_ARCH >= 11
+-- 
+2.43.0
+

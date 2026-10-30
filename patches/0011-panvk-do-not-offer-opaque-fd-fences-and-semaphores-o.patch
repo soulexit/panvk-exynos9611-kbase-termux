@@ -1,0 +1,36 @@
+From b1c83cee34646c7fa9196220786e8236d772d4e4 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 30 Oct 2026 02:27:43 +0300
+Subject: [PATCH 11/16] panvk: do not offer opaque fd fences and semaphores on
+ kbase
+
+kbase syncobjs live in the process: sync files go in and out, but there
+is no opaque fd for one, so exporting failed with VK_ERROR_UNKNOWN.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_physical_device.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index e989494..0433e26 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -342,6 +342,13 @@ get_device_sync_types(struct panvk_physical_device *device,
+                        "failed to query syncobj features");
+    }
+ 
++   /* kbase's syncobjs live in this process: a sync file goes in and out (the kernel's fences),
++    * but there is no opaque fd for one, so do not offer that handle type. */
++   if (pan_kmod_dev_is_kbase(device->kmod.dev)) {
++      device->drm_syncobj_type.import_opaque_fd = NULL;
++      device->drm_syncobj_type.export_opaque_fd = NULL;
++   }
++
+    device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
+ 
+    /* kbase's in-process syncobjs are binary, on CSF parts too: timelines are emulated there as
+-- 
+2.43.0
+

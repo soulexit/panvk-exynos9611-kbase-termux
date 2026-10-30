@@ -1,0 +1,205 @@
+From 45704671cc2b61de040de4ec83abdb59979af497 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 30 Oct 2026 03:27:16 +0300
+Subject: [PATCH 16/16] panvk/jm: layered rendering with geometry shaders
+
+- a draw replays per layer only when a pre-rasterization stage writes
+  gl_Layer (or for multiview): otherwise its primitives belong on layer
+  0, and drawing them on every layer was wrong and slow;
+- the geometry shader emulation moves vertices for other layers off
+  screen in each layer's pass, and lower_layer_writes, which reads the
+  graphics layer_id sysval, is left to vertex shaders: geometry and tess
+  eval shaders run as compute;
+- an empty vertex shader in front of a geometry shader or tessellation
+  writes a zero position, so its draw is not skipped as having no
+  vertex shader (the next stage makes the primitives).
+
+geometry.layered CTS: 100 -> 8 failures.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c | 32 ++++++++++++++++++----
+ src/panfrost/vulkan/panvk_gs.h             |  4 ++-
+ src/panfrost/vulkan/panvk_nir_lower_gs.c   | 13 +++++++++
+ src/panfrost/vulkan/panvk_shader.h         |  3 ++
+ src/panfrost/vulkan/panvk_vX_shader.c      | 21 +++++++++++++-
+ 5 files changed, 65 insertions(+), 8 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index fa39a3a..b98f8e6 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -2095,6 +2095,7 @@ emit_gs_job(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw,
+       .xfb_stream_slots = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_stream_slots,
+       .xfb_stream_idx = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_stream_idx,
+       .xfb_invocations = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_invocations,
++      .layer = draw->info.layer_id,
+       /* The tess eval job leaves clip-space positions for the geometry shader job. */
+       .in_screen_space =
+          !tes_in && !panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader)->gs.vs_clip_space,
+@@ -2585,6 +2586,29 @@ panvk_note_path(const char *what)
+    simple_mtx_unlock(&lock);
+ }
+ 
++/* The layers a draw runs on. Every view of multiview; otherwise, layered rendering puts each
++ * primitive on the layer its last pre-rasterization stage writes, and on layer 0 when that
++ * stage writes none -- so only a stage writing gl_Layer needs the draw replayed per layer. */
++static uint32_t
++draw_layer_count(const struct panvk_cmd_buffer *cmdbuf)
++{
++   const uint32_t view_mask = cmdbuf->state.gfx.render.view_mask;
++   if (view_mask)
++      return util_bitcount(view_mask);
++
++   const struct panvk_shader *app_gs = cmdbuf->state.gfx.gs.app_shader;
++   const struct panvk_shader *tes = cmdbuf->state.gfx.tess.tes;
++   const struct panvk_shader_variant *vs = panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
++   const bool writes_layer =
++      app_gs ? (panvk_shader_only_variant(app_gs)->gs.outputs_written &
++                BITFIELD64_BIT(VARYING_SLOT_LAYER)) != 0
++      : tes  ? (panvk_shader_only_variant(tes)->gs.outputs_written &
++                BITFIELD64_BIT(VARYING_SLOT_LAYER)) != 0
++             : vs->gs.vs_writes_layer;
++   return writes_layer ? cmdbuf->state.gfx.render.layer_count
++                       : MIN2(cmdbuf->state.gfx.render.layer_count, 1);
++}
++
+ static void
+ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
+ {
+@@ -2634,9 +2658,7 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
+ 
+    uint32_t view_mask = cmdbuf->state.gfx.render.view_mask;
+    assert(view_mask == 0 || util_bitcount(view_mask) <= batch->fb.layer_count);
+-   uint32_t enabled_layer_count = view_mask
+-                                     ? util_bitcount(view_mask)
+-                                     : cmdbuf->state.gfx.render.layer_count;
++   uint32_t enabled_layer_count = draw_layer_count(cmdbuf);
+ 
+    for (uint32_t i = 0; i < enabled_layer_count; i++) {
+       const uint32_t layer = (view_mask != 0) ? u_bit_scan(&view_mask) : i;
+@@ -2822,9 +2844,7 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+ 
+    uint32_t view_mask = cmdbuf->state.gfx.render.view_mask;
+    assert(view_mask == 0 || util_bitcount(view_mask) <= batch->fb.layer_count);
+-   uint32_t enabled_layer_count = view_mask
+-                                     ? util_bitcount(view_mask)
+-                                     : cmdbuf->state.gfx.render.layer_count;
++   uint32_t enabled_layer_count = draw_layer_count(cmdbuf);
+ 
+    const unsigned ready_job = draw_helper_ready_job(cmdbuf);
+    if (!ready_job)
+diff --git a/src/panfrost/vulkan/panvk_gs.h b/src/panfrost/vulkan/panvk_gs.h
+index 106ea45..f350f6c 100644
+--- a/src/panfrost/vulkan/panvk_gs.h
++++ b/src/panfrost/vulkan/panvk_gs.h
+@@ -132,7 +132,9 @@ struct panvk_gs_push {
+    uint32_t xfb_stream_slots;
+    uint32_t xfb_stream_idx;
+    uint32_t xfb_invocations;
+-   uint32_t pad4;
++   /* The framebuffer layer this pass draws: a draw runs once per layer, and a shader writing
++    * gl_Layer has its vertices for other layers moved off screen. */
++   uint32_t layer;
+ };
+ 
+ /* gl_ViewportIndex, carried from the emulation to the fragment shader. VARYING_SLOT_VIEWPORT is a
+diff --git a/src/panfrost/vulkan/panvk_nir_lower_gs.c b/src/panfrost/vulkan/panvk_nir_lower_gs.c
+index 011242f..ced51d6 100644
+--- a/src/panfrost/vulkan/panvk_nir_lower_gs.c
++++ b/src/panfrost/vulkan/panvk_nir_lower_gs.c
+@@ -108,6 +108,9 @@ struct lower_gs_state {
+    /* gl_ViewportIndex: the shader's variable, and the per-viewport transform table. */
+    nir_variable *viewport_var;
+    nir_def *viewports;
++   /* gl_Layer: the shader's variable, and the layer this pass draws. */
++   nir_variable *layer_var;
++   nir_def *layer;
+    /* gl_PrimitiveIDIn (per instance) and gl_InvocationID. */
+    nir_def *prim_id;
+    nir_def *invocation_id;
+@@ -660,6 +663,13 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
+             }
+             if (!opts->hardpos)
+                val = nir_bcsel(b, nir_ine_imm(b, st->out_clip_space, 0), clip, val);
++            /* Layered rendering draws once per layer: a vertex for another layer goes far off
++             * screen, which takes its primitive out of this layer's tiles. */
++            if (st->layer_var) {
++               nir_def *off = nir_imm_vec4(b, -65536.0, -65536.0, 0.5, 1.0);
++               val = nir_bcsel(b, nir_ieq(b, nir_load_var(b, st->layer_var), st->layer), val,
++                               off);
++            }
+             if (opts->hardpos) {
+                /* Screen space, 64x64: (4,60) (32,60) (60,4). */
+                nir_def *fc = nir_u2f32(b, counter);
+@@ -985,6 +995,9 @@ panvk_nir_lower_gs(struct nir_shader *nir, const struct panvk_gs_lower_options *
+       nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_VIEWPORT);
+    if (st.viewport_var)
+       st.viewports = load_param_u64(&b, opts, offsetof(struct panvk_gs_push, viewports));
++   st.layer_var = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_LAYER);
++   if (st.layer_var)
++      st.layer = load_param_u32(&b, opts, offsetof(struct panvk_gs_push, layer));
+    st.in_general_stride =
+       load_param_u32(&b, opts, offsetof(struct panvk_gs_push, in_general_stride));
+    st.out_general_stride =
+diff --git a/src/panfrost/vulkan/panvk_shader.h b/src/panfrost/vulkan/panvk_shader.h
+index 9e28f90..8b18248 100644
+--- a/src/panfrost/vulkan/panvk_shader.h
++++ b/src/panfrost/vulkan/panvk_shader.h
+@@ -454,6 +454,9 @@ struct panvk_shader_variant {
+       /* Vertex shader variants: compiled to feed the emulation, so gl_Position is clip space
+        * (pan_compile_inputs::vs_keep_clip_space) and must be stored unsnapped. */
+       bool vs_clip_space;
++      /* Vertex shader variants: writes gl_Layer (filtered per layer, see lower_layer_writes).
++       * Geometry and tess eval shaders say so in outputs_written. */
++      bool vs_writes_layer;
+       /* Vertex shader variants: how many clip and cull distances it writes, in that order in
+        * VARYING_SLOT_CLIP_DIST0/1 (see panvk_nir_lower_cull_vs). The fragment shader linked
+        * against it tests exactly these. */
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 0f0f928..8f74e76 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -274,7 +274,9 @@ lower_gl_pos_layer_writes(nir_builder *b, nir_instr *instr, void *data)
+ static bool
+ lower_layer_writes(nir_shader *nir)
+ {
+-   if (nir->info.stage == MESA_SHADER_FRAGMENT)
++   /* Geometry and tess eval shaders run as compute through the emulation, which drops the
++    * primitives of other layers itself (panvk_nir_lower_gs.c). */
++   if (nir->info.stage != MESA_SHADER_VERTEX)
+       return false;
+ 
+    nir_variable *temp_layer_var = NULL;
+@@ -1931,10 +1933,27 @@ panvk_compile_shader(struct panvk_device *dev,
+          NIR_PASS(_, info->nir, nir_lower_var_copies);
+          NIR_PASS(_, info->nir, panvk_nir_lower_cull_vs, clip_count);
+       }
++
++      /* An empty shader compiles to nothing, and a draw without a vertex shader binary is
++       * skipped -- but in front of a geometry shader (or tessellation) the draw still has to run,
++       * since that stage makes the primitives. A vertex shader that writes no position writes a
++       * zero one (what the next stage reads of it is undefined), which keeps it non-empty. */
++      if (inputs.vs_keep_clip_space && !info->nir->info.io_lowered &&
++          !nir_find_variable_with_location(info->nir, nir_var_shader_out, VARYING_SLOT_POS)) {
++         nir_variable *pos = nir_variable_create(info->nir, nir_var_shader_out,
++                                                 glsl_vec4_type(), "gl_Position");
++         pos->data.location = VARYING_SLOT_POS;
++         nir_function_impl *impl = nir_shader_get_entrypoint(info->nir);
++         nir_builder pb = nir_builder_at(nir_after_impl(impl));
++         nir_store_var(&pb, pos, nir_imm_vec4(&pb, 0.0, 0.0, 0.0, 1.0), 0xf);
++         info->nir->info.outputs_written |= VARYING_BIT_POS;
++      }
+ #endif
+       for (enum panvk_vs_variant v = 0; v <= last_variant; v++) {
+          struct panvk_shader_variant *variant = &shader->variants[v];
+          variant->gs.vs_clip_space = inputs.vs_keep_clip_space;
++         variant->gs.vs_writes_layer =
++            nir_find_variable_with_location(info->nir, nir_var_shader_out, VARYING_SLOT_LAYER);
+ #if PAN_ARCH < 9
+          variant->gs.vs_clip_count = clip_count;
+          variant->gs.vs_cull_count = cull_count;
+-- 
+2.43.0
+

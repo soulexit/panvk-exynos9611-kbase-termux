@@ -83,6 +83,29 @@ Versioning is `v0.01`, `v0.02`, … for debug builds; a build only moves forward
 | v0.02 | 2026-10-26 | Mesa 27.0.0-devel + kbase JM + 2 local patches | **PASS** (L0 + L1 + offscreen) | **DXVK D3D9 PASS** — NFS Most Wanted intro/title/menu video at 50–60 FPS, 0 GPU faults | **PASS** — Kingdom Hearts, parity with v0.01 | New base; Eden reaches title + menus (gameplay still faults) |
 | v0.01 | 2026-10-21 | Mesa 26.3.0-devel + kbase JM | **PASS** (L0 + L1 + offscreen) | **swapchain PASS**, DXVK map failure | **PASS** — Kingdom Hearts native + 2x | First device build; see test log |
 
+### Unreleased: Vulkan CTS fixes (patches 0006–0016)
+
+The Khronos CTS was run on the phone for every advertised extension
+([`docs/CTS-RESULTS.md`](docs/CTS-RESULTS.md), tooling in [`tools/cts`](tools/cts/README.md)).
+Failures over the 89,530 sampled cases went from **816 to 100**. Not yet re-tested in Eden,
+Winlator or ARMSX2, so there is no release build of these yet.
+
+- **Storage images and texel buffers in vertex shaders** used the wrong descriptor (a byte offset
+  passed as an index).
+- **Null descriptors** (robustness2 `nullDescriptor`, which DXVK enables): size queries return 0
+  and loads return zeroes; out-of-bounds texel buffer loads of formats with alpha return (0,0,0,0).
+  A null index buffer (maintenance6) reads zeroes instead of address 0.
+- **Adjacency topologies without a geometry shader** go through an internal geometry shader
+  (they hit `UNREACHABLE` before); primitive restart works for lists; wide lines out of a
+  geometry shader keep their width.
+- **Geometry shaders:** layered rendering through `gl_Layer`, 16-bit varyings, shaders that emit
+  nothing, and empty vertex shaders in front of a geometry shader. A draw into a layered
+  framebuffer is no longer repeated on every layer when nothing writes `gl_Layer`.
+- **kbase handle types:** external memory is dma-buf import only and fences/semaphores are sync
+  fd only (opaque fds and memory export cannot work on kbase and failed or crashed).
+- **Zero-initialized memory** is cleared on kbase, which recycles freed pages unchanged.
+- `B4G4R4A4_UNORM_PACK16` sampled with the wrong swizzle on v6.
+
 ### v0.03 changes
 
 - **Eden gameplay works.** Zelda: Echoes of Wisdom renders in-game (Suthorn Ruins) at a steady
@@ -198,6 +221,8 @@ docs/
   BUILD.md                 host, Termux and proot build instructions
   TESTING.md               test procedure and what to report
   DEBUGGING.md             environment switches, log tags, fault triage
+  CTS-RESULTS.md           Vulkan CTS results per extension
+tools/cts/                 build and run the Khronos CTS on the phone
   TEST-RESULTS.md          per-build results (updated every release)
   REPORT-TEMPLATE.md       copy/paste test report
 ```

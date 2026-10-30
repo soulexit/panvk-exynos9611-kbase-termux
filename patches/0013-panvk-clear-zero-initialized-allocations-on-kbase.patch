@@ -1,0 +1,69 @@
+From 2f546dbcf4d9cf86397f33925e26c2082ca51066 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 30 Oct 2026 02:36:31 +0300
+Subject: [PATCH 13/16] panvk: clear zero-initialized allocations on kbase
+
+kbase recycles a process's freed pages into its later allocations
+without clearing them, so memory allocated with
+VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT came back holding old data.
+Clear it through a CPU mapping. zero_initialize_device_memory CTS: 211
+-> 16 failures (BC1, which is emulated).
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_device_memory.c | 24 +++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_device_memory.c b/src/panfrost/vulkan/panvk_device_memory.c
+index 5963ac0..eb137de 100644
+--- a/src/panfrost/vulkan/panvk_device_memory.c
++++ b/src/panfrost/vulkan/panvk_device_memory.c
+@@ -12,6 +12,7 @@
+ #include "panvk_device_memory.h"
+ #include "panvk_entrypoints.h"
+ 
++#include "kmod/kbase_kmod.h"
+ #include "pan_props.h"
+ 
+ #include "util/u_atomic.h"
+@@ -180,6 +181,21 @@ panvk_AllocateMemory(VkDevice _device,
+ 
+    mem->addr.dev = op.va.start;
+ 
++   /* kbase recycles a process's freed pages into its own allocations without clearing them, so
++    * VK_EXT_zero_initialize_device_memory has to clear them here. */
++   if (!fd_info && (mem->vk.alloc_flags & VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT) &&
++       pan_kmod_dev_is_kbase(device->kmod.dev)) {
++      const size_t bo_size = pan_kmod_bo_size(mem->bo);
++      void *cpu = pan_kmod_bo_mmap(mem->bo, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
++      if (cpu == MAP_FAILED) {
++         result = panvk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++         goto err_unbind;
++      }
++      memset(cpu, 0, bo_size);
++      pan_kmod_queue_bo_map_sync(mem->bo, 0, cpu, bo_size, PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH);
++      os_munmap(cpu, bo_size);
++   }
++
+    panvk_address_binding_report(device, &mem->vk.base, mem->addr.dev,
+                                 pan_kmod_bo_size(mem->bo),
+                                 VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+@@ -222,6 +238,14 @@ panvk_AllocateMemory(VkDevice _device,
+ 
+    return VK_SUCCESS;
+ 
++err_unbind: {
++   struct pan_kmod_vm_op unmap = {
++      .type = PAN_KMOD_VM_OP_TYPE_UNMAP,
++      .va = op.va,
++   };
++   pan_kmod_vm_bind(device->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &unmap, 1);
++}
++
+ err_return_va:
+    if (!(device->kmod.vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA)) {
+       panvk_as_free(device, op.va.start, op.va.size);
+-- 
+2.43.0
+

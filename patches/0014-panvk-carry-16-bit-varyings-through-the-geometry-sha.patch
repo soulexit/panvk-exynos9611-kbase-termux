@@ -1,0 +1,53 @@
+From 1b7e07f7c0cb3d5daaeba8784aa27b1d3719b45f Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 30 Oct 2026 02:50:59 +0300
+Subject: [PATCH 14/16] panvk: carry 16-bit varyings through the geometry
+ shader emulation
+
+The emulation skipped every output that was not 32-bit, and read input
+components at 4 bytes apart whatever their size. Widen 16-bit outputs to
+the emulation's 32-bit layout (the fragment shader's attribute format
+narrows them back) and step inputs by their own size. Fixes 271
+16bit_storage input_output CTS failures in geometry and tessellation
+stages.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_nir_lower_gs.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/vulkan/panvk_nir_lower_gs.c b/src/panfrost/vulkan/panvk_nir_lower_gs.c
+index f92fb7d..011242f 100644
+--- a/src/panfrost/vulkan/panvk_nir_lower_gs.c
++++ b/src/panfrost/vulkan/panvk_nir_lower_gs.c
+@@ -546,8 +546,10 @@ lower_per_vertex_input(nir_builder *b, nir_intrinsic_instr *intr,
+       offset = load_slot_offset(b, st->in_offsets, location);
+    }
+ 
++   /* The vertex shader's layout packs a location's components at their own size. */
+    nir_def *byte = nir_iadd(b, nir_imul(b, vtx, stride),
+-                            nir_iadd_imm(b, offset, nir_intrinsic_component(intr) * 4));
++                            nir_iadd_imm(b, offset, nir_intrinsic_component(intr) *
++                                                       (intr->def.bit_size / 8)));
+    nir_def *addr = nir_iadd(b, base, nir_u2u64(b, byte));
+ 
+    if (opts->echo && intr->def.num_components == 4 && intr->def.bit_size == 32) {
+@@ -702,6 +704,14 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
+             if (glsl_type_is_array(type))
+                d = nir_build_deref_array_imm(b, d, e);
+             nir_def *val = nir_load_deref(b, d);
++            /* The output layout is 32-bit (panvk_shader_link): widen 16-bit outputs, which the
++             * fragment shader's attribute format narrows back. */
++            if (val->bit_size == 16) {
++               const enum glsl_base_type bt = glsl_get_base_type(elem_type);
++               val = bt == GLSL_TYPE_FLOAT16 ? nir_f2f32(b, val)
++                     : bt == GLSL_TYPE_INT16 ? nir_i2i32(b, val)
++                                             : nir_u2u32(b, val);
++            }
+             if (val->bit_size != 32)
+                continue;
+ 
+-- 
+2.43.0
+

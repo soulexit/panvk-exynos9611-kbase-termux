@@ -1,0 +1,215 @@
+From 21014b91e5936cd8ac08b65e13c4492c56aab1b6 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 30 Oct 2026 02:18:57 +0300
+Subject: [PATCH 10/16] panvk/jm: draw adjacency topologies without a geometry
+ shader
+
+The v6/v7 tiler has no adjacency modes, and translate_prim hit
+UNREACHABLE for a *_WITH_ADJACENCY draw without a geometry shader. Run
+such draws through the geometry shader emulation with an internal shader
+that drops the adjacent vertices, like the polygon-mode one.
+
+Also:
+- take the line width from the primitive the tiler draws, so lines out
+  of a geometry shader (internal or not) are wide too;
+- unroll primitive restart for list topologies in the emulation as well,
+  since a restart index drops the incomplete primitive of a list.
+
+Fixes 82 adjacency/restart CTS failures (rasterization, input_assembly,
+index_type_uint8, pipeline libraries).
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c | 26 ++++++--
+ src/panfrost/vulkan/panvk_device.h         |  5 +-
+ src/panfrost/vulkan/panvk_shader.h         |  1 +
+ src/panfrost/vulkan/panvk_vX_shader.c      | 73 +++++++++++++++++++---
+ 4 files changed, 91 insertions(+), 14 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index cf533e4..51a497f 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -1309,9 +1309,17 @@ panvk_emit_tiler_primitive_size(struct panvk_cmd_buffer *cmdbuf,
+    const bool writes_point_size =
+       vs->info.vs.writes_point_size && draw->info.prim == MESA_PRIM_POINTS;
+ 
++   /* The line width applies to the lines the tiler draws, which with a geometry shader (an
++    * internal one included, e.g. for adjacency topologies) are its output, not the topology. */
++   const enum mesa_prim reduced_prim = u_reduced_prim(
++      draw->gs_varying_bufs && !cmdbuf->state.gfx.gs.posonly ? cmdbuf->state.gfx.gs.out_prim
++                                                             : draw->info.prim);
++
+    pan_pack(primsz, PRIMITIVE_SIZE, cfg) {
+       if (writes_point_size) {
+          cfg.size_array = draw->psiz;
++      } else if (reduced_prim == MESA_PRIM_LINES) {
++         cfg.fixed_sized = cmdbuf->vk.dynamic_graphics_state.rs.line.width;
+       } else {
+          cfg.fixed_sized = draw->line_width;
+       }
+@@ -1983,11 +1991,11 @@ emit_gs_job(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw,
+    if (!in_prims)
+       return dep_job_id;
+ 
+-   /* Primitive restart splits strips and fans at index values only the GPU can see: have
++   /* Primitive restart splits strips and fans at index values only the GPU can see, and drops
++    * the incomplete primitive of a list (primitiveTopologyListRestart): have
+     * panlib_gs_restart_unroll write the primitives out as a list first, and read that the way an
+     * indirect draw is read. prims_per_instance above is the no-restart count, an upper bound. */
+-   const bool restart = !tess && draw->info.index.index_size && draw->info.index.restart_enable &&
+-                        gs_topology(draw->info.prim) != PANVK_GS_TOPO_LIST;
++   const bool restart = !tess && draw->info.index.index_size && draw->info.index.restart_enable;
+    uint64_t unrolled = 0, unrolled_cmd = 0, index_min = draw->index_min_addr;
+    if (restart) {
+       const uint32_t vpp = MAX2(gs->gs.input_verts_per_prim, 1);
+@@ -2513,7 +2521,8 @@ emit_xfb_jobs(struct panvk_cmd_buffer *cmdbuf, unsigned dep_job_id)
+ 
+ /*
+  * The geometry shader this draw runs: the application's, or, with none bound, the internal one
+- * that draws triangles as lines or points for VK_POLYGON_MODE_LINE/POINT (the tiler only fills).
++ * that draws triangles as lines or points for VK_POLYGON_MODE_LINE/POINT (the tiler only fills),
++ * or the one that drops the adjacent vertices of an adjacency topology (the tiler has none).
+  * Switching marks the shader dirty, which relinks the varyings against it.
+  */
+ static void
+@@ -2531,6 +2540,15 @@ panvk_select_gs(struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_data *d
+         draw->info.prim == MESA_PRIM_TRIANGLE_FAN))
+       gs = panvk_per_arch(polygon_mode_gs)(dev, rs->polygon_mode == VK_POLYGON_MODE_POINT);
+ 
++   if (!gs && !rs->rasterizer_discard_enable &&
++       (draw->info.prim == MESA_PRIM_LINES_ADJACENCY ||
++        draw->info.prim == MESA_PRIM_LINE_STRIP_ADJACENCY ||
++        draw->info.prim == MESA_PRIM_TRIANGLES_ADJACENCY ||
++        draw->info.prim == MESA_PRIM_TRIANGLE_STRIP_ADJACENCY))
++      gs = panvk_per_arch(adjacency_gs)(dev, draw->info.prim == MESA_PRIM_TRIANGLES_ADJACENCY ||
++                                                draw->info.prim ==
++                                                   MESA_PRIM_TRIANGLE_STRIP_ADJACENCY);
++
+    if (cmdbuf->state.gfx.gs.shader != gs) {
+       cmdbuf->state.gfx.gs.shader = gs;
+       gfx_state_set_dirty(cmdbuf, GS);
+diff --git a/src/panfrost/vulkan/panvk_device.h b/src/panfrost/vulkan/panvk_device.h
+index 8acf7b7..9a511c5 100644
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -75,10 +75,11 @@ struct panvk_device {
+    struct panvk_priv_bo *tess_heap;
+ 
+    /* v6/v7: the internal geometry shaders that draw triangles as lines ([0]) or points ([1]) for
+-    * VK_POLYGON_MODE_LINE/POINT, built on first use (panvk_per_arch(polygon_mode_gs)). */
++    * VK_POLYGON_MODE_LINE/POINT, and adjacency lines ([2]) and triangles ([3]) without their
++    * adjacent vertices, built on first use (panvk_per_arch(polygon_mode_gs), adjacency_gs). */
+    struct {
+       simple_mtx_t lock;
+-      struct vk_shader *shader[2];
++      struct vk_shader *shader[4];
+    } polygon_gs;
+ 
+    /* Bifrost (v6/v7) has no NULL descriptor. With nullDescriptor enabled, a null write copies one
+diff --git a/src/panfrost/vulkan/panvk_shader.h b/src/panfrost/vulkan/panvk_shader.h
+index d5e13bf..9e28f90 100644
+--- a/src/panfrost/vulkan/panvk_shader.h
++++ b/src/panfrost/vulkan/panvk_shader.h
+@@ -700,6 +700,7 @@ VkResult panvk_per_arch(create_shader)(
+ 
+ #if PAN_ARCH < 9
+ struct panvk_shader *panvk_per_arch(polygon_mode_gs)(struct panvk_device *dev, bool points);
++struct panvk_shader *panvk_per_arch(adjacency_gs)(struct panvk_device *dev, bool tris);
+ #endif
+ 
+ #endif
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 0f6f002..0f0f928 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -3660,20 +3660,77 @@ build_polygon_mode_gs(bool points)
+    return nir;
+ }
+ 
+-struct panvk_shader *
+-panvk_per_arch(polygon_mode_gs)(struct panvk_device *dev, bool points)
++/*
++ * The *_WITH_ADJACENCY topologies without a geometry shader: the tiler has no adjacency modes on
++ * v6/v7, so the draw goes through the emulation with this internal shader, which emits the
++ * primitive without its adjacent vertices (1, 2 of a line; 0, 2, 4 of a triangle), keeping the
++ * provoking vertex in either mode. The emulation assembles the strip topologies. Same varying
++ * copy as build_polygon_mode_gs.
++ */
++static nir_shader *
++build_adjacency_gs(bool tris)
++{
++   const nir_shader_compiler_options *opts =
++      pan_get_nir_shader_compiler_options(PAN_ARCH, MESA_SHADER_GEOMETRY, false);
++   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY, opts,
++                                                  "panvk_adjacency_%s",
++                                                  tris ? "triangles" : "lines");
++   nir_shader *nir = b.shader;
++   const unsigned vin = tris ? 6 : 4, vout = tris ? 3 : 2;
++
++   nir->info.gs.input_primitive = tris ? MESA_PRIM_TRIANGLES_ADJACENCY : MESA_PRIM_LINES_ADJACENCY;
++   nir->info.gs.output_primitive = tris ? MESA_PRIM_TRIANGLE_STRIP : MESA_PRIM_LINE_STRIP;
++   nir->info.gs.vertices_in = vin;
++   nir->info.gs.vertices_out = vout;
++   nir->info.gs.invocations = 1;
++   nir->info.gs.active_stream_mask = 1;
++
++   const struct glsl_type *in_type = glsl_array_type(glsl_vec4_type(), vin, 0);
++   nir_variable *in[33], *out[33];
++   for (unsigned i = 0; i < 33; i++) {
++      const gl_varying_slot loc = i ? VARYING_SLOT_VAR0 + i - 1 : VARYING_SLOT_POS;
++      in[i] = nir_variable_create(nir, nir_var_shader_in, in_type, NULL);
++      in[i]->data.location = loc;
++      out[i] = nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), NULL);
++      out[i]->data.location = loc;
++   }
++
++   for (unsigned v = 0; v < vout; v++) {
++      const unsigned k = tris ? v * 2 : v + 1;
++      for (unsigned i = 0; i < 33; i++)
++         nir_store_var(&b, out[i], nir_load_array_var_imm(&b, in[i], k), 0xf);
++      nir_emit_vertex(&b, 0);
++   }
++   nir_end_primitive(&b, 0);
++
++   return nir;
++}
++
++static struct panvk_shader *
++get_internal_gs(struct panvk_device *dev, unsigned idx, nir_shader *(*build)(bool), bool arg)
+ {
+    simple_mtx_lock(&dev->polygon_gs.lock);
+-   if (!dev->polygon_gs.shader[points]) {
++   if (!dev->polygon_gs.shader[idx]) {
+       struct panvk_shader *shader;
+-      if (panvk_per_arch(create_shader)(dev, build_polygon_mode_gs(points), &shader) ==
+-          VK_SUCCESS)
+-         dev->polygon_gs.shader[points] = &shader->vk;
++      if (panvk_per_arch(create_shader)(dev, build(arg), &shader) == VK_SUCCESS)
++         dev->polygon_gs.shader[idx] = &shader->vk;
+    }
+    simple_mtx_unlock(&dev->polygon_gs.lock);
+ 
+-   return dev->polygon_gs.shader[points]
+-             ? container_of(dev->polygon_gs.shader[points], struct panvk_shader, vk)
++   return dev->polygon_gs.shader[idx]
++             ? container_of(dev->polygon_gs.shader[idx], struct panvk_shader, vk)
+              : NULL;
+ }
++
++struct panvk_shader *
++panvk_per_arch(polygon_mode_gs)(struct panvk_device *dev, bool points)
++{
++   return get_internal_gs(dev, points, build_polygon_mode_gs, points);
++}
++
++struct panvk_shader *
++panvk_per_arch(adjacency_gs)(struct panvk_device *dev, bool tris)
++{
++   return get_internal_gs(dev, 2 + tris, build_adjacency_gs, tris);
++}
+ #endif
+-- 
+2.43.0
+
