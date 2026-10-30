@@ -18,9 +18,18 @@ but has not been validated on the device.
 
 | Version | Date | Driver | L0 enumerate | L1 offscreen | L2 WSI | L3 app | Notes |
 |---|---|---|---|---|---|---|---|
+| v0.04 | 2026-10-30 | Mesa 27.0.0-devel, base `d896b0a` + 17 patches, kbase JM | **PASS** | **PASS** (Vulkan CTS) | not re-tested | not re-tested in any app | Vulkan CTS fixes |
 | v0.03 | 2026-10-28 | Mesa 27.0.0-devel, base `d896b0a` + 5 patches, kbase JM | **PASS** | **PASS** (compute + triangle) | **PASS** (Eden) | **PASS** Eden/Zelda: Echoes of Wisdom in-game; Winlator and ARMSX2 not re-tested | Eden gameplay |
 | v0.02 | 2026-10-26 | Mesa 27.0.0-devel, base `d896b0a` + 2 patches, kbase JM | **PASS** | **PASS** (compute + triangle) | **PASS** (Winlator, Eden, ARMSX2) | **PASS** ARMSX2/Kingdom Hearts; **PASS** Winlator DXVK D3D9 (NFS MW intro + title); Eden title/menus only | new base, Eden + DXVK fixes |
 | v0.01 | 2026-10-21 | Mesa 26.3.0-devel, base `fb3b49d`, kbase JM | **PASS** | **PASS** (compute + triangle) | **PASS** (Winlator compositor) | **PASS** (ARMSX2/Kingdom Hearts); Winlator DXVK pending | first debug build |
+
+### v0.04 details
+
+Released without an app test, on request. **L0/L1** through the Khronos Vulkan CTS 1.4.7.1 on the
+phone (see [`CTS-RESULTS.md`](CTS-RESULTS.md)): over 89,530 sampled cases, 33,218 pass and 100
+fail (816 on the first run), with no crash left in the driver; 400 previously passing cases
+re-run on the release binary (`git-df5c7edf26`) all pass. Eden, Winlator and ARMSX2 were not
+re-tested.
 
 ### v0.03 details
 

@@ -79,16 +79,18 @@ Versioning is `v0.01`, `v0.02`, … for debug builds; a build only moves forward
 
 | Build | Date | Driver | Termux `vulkaninfo` | Winlator | ARMSX2 | Notes |
 |---|---|---|---|---|---|---|
+| v0.04 | 2026-10-30 | Mesa 27.0.0-devel + kbase JM + 17 local patches | **PASS** (Vulkan CTS: 33,218 pass, 100 fail over 89,530 sampled cases, 0 driver crashes) | not re-tested on this build | not re-tested on this build | **Vulkan CTS fixes** — not re-tested in any app |
 | v0.03 | 2026-10-28 | Mesa 27.0.0-devel + kbase JM + 5 local patches | **PASS** (L0 + L1 + offscreen) | not re-tested on this build | not re-tested on this build | **Eden: Zelda: Echoes of Wisdom in-game, 6–7.5 FPS, 0 GPU faults** |
 | v0.02 | 2026-10-26 | Mesa 27.0.0-devel + kbase JM + 2 local patches | **PASS** (L0 + L1 + offscreen) | **DXVK D3D9 PASS** — NFS Most Wanted intro/title/menu video at 50–60 FPS, 0 GPU faults | **PASS** — Kingdom Hearts, parity with v0.01 | New base; Eden reaches title + menus (gameplay still faults) |
 | v0.01 | 2026-10-21 | Mesa 26.3.0-devel + kbase JM | **PASS** (L0 + L1 + offscreen) | **swapchain PASS**, DXVK map failure | **PASS** — Kingdom Hearts native + 2x | First device build; see test log |
 
-### Unreleased: Vulkan CTS fixes (patches 0006–0017)
+### v0.04 changes: Vulkan CTS fixes (patches 0006–0017)
 
 The Khronos CTS was run on the phone for every advertised extension
 ([`docs/CTS-RESULTS.md`](docs/CTS-RESULTS.md), tooling in [`tools/cts`](tools/cts/README.md)).
-Failures over the 89,530 sampled cases went from **816 to 100**. Not yet re-tested in Eden,
-Winlator or ARMSX2, so there is no release build of these yet.
+Failures over the 89,530 sampled cases went from **816 to 100**. **v0.04 was released without
+being re-tested in Eden, Winlator or ARMSX2**: if an app that worked on v0.03 breaks, go back to
+v0.03 and report it.
 
 - **Storage images and texel buffers in vertex shaders** used the wrong descriptor (a byte offset
   passed as an index).
@@ -192,7 +194,8 @@ full test log.
 - **Eden is slow and memory-bound.** Zelda: Echoes of Wisdom runs at 6–7.5 FPS at 1x; Eden's
   emulated RAM plus its GPU memory fill a 6 GB phone. Eden's *GPU unswizzle* option corrupted
   textures with earlier builds — keep it off.
-- **v0.03 was not re-tested in Winlator or ARMSX2** (the AFBC and heap changes affect them).
+- **v0.04 was not re-tested in any app** (Eden, Winlator, ARMSX2), and v0.03 not in Winlator or
+  ARMSX2. v0.04 changes draws into layered framebuffers, null descriptors and geometry shaders.
 - **No D3D12 / vkd3d-proton path.** That needs features this driver does not provide yet.
 - **GS/tessellation/XFB are compute-emulated**, so they are slow on a 3-core G72.
 - **4–6 GB shared RAM.** GPU allocations come out of the same memory as Android and Wine.
@@ -204,7 +207,7 @@ full test log.
 
 ```text
 README.md                  this file
-VERSION                    current debug build number (0.03)
+VERSION                    current debug build number (0.04)
 NOTICE.md                  attribution and licensing
 profiles/                  device/kbase profile (JSON)
 patches/                   local patch series on top of the pinned base commit
@@ -320,8 +323,8 @@ From a release zip:
 
 ```sh
 cd ~
-curl -LO https://github.com/soulexit/panvk-exynos9611-kbase-termux/releases/download/v0.03/panvk-exynos9611-termux-v0.03.zip
-unzip -o panvk-exynos9611-termux-v0.03.zip -d panvk-v003
+curl -LO https://github.com/soulexit/panvk-exynos9611-kbase-termux/releases/download/v0.04/panvk-exynos9611-termux-v0.04.zip
+unzip -o panvk-exynos9611-termux-v0.04.zip -d panvk-v004
 bash panvk-v003/install-termux.sh
 ```
 
