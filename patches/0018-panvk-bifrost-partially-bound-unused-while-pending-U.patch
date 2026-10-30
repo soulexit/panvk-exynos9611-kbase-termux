@@ -1,0 +1,168 @@
+From 5c9141aa79386d2bcc9e1d702e365980ac68ce58 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 30 Oct 2026 12:26:12 +0300
+Subject: [PATCH] panvk/bifrost: partially bound, unused-while-pending, UAB
+ sampled images
+
+Offer descriptorBindingPartiallyBound,
+descriptorBindingUpdateUnusedWhilePending and
+descriptorBindingSampledImageUpdateAfterBind on v6/v7 as well. Bifrost
+copies descriptors into the shader tables with a job that runs at
+execution time, which is what update-after-bind needs; the CPU copy
+taken when the draw is recorded is skipped for update-after-bind sets,
+which may still change before the submit. The update-after-bind limits
+take the regular ones (they were 0). descriptorIndexing as a whole
+stays off: its limits are out of reach on Bifrost.
+
+dEQP-VK.descriptor_indexing: 93 pass (sampled image / combined image
+sampler after_bind variants included), 22 not supported (other
+update-after-bind types), 0 fail.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../vulkan/bifrost/panvk_vX_meta_desc_copy.c  |  8 ++-
+ .../vulkan/panvk_vX_physical_device.c         | 52 ++++++++++---------
+ 2 files changed, 35 insertions(+), 25 deletions(-)
+
+diff --git a/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c b/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
+index 4095f91..4bbdcb4 100644
+--- a/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
++++ b/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
+@@ -324,7 +324,9 @@ single_desc_copy(nir_builder *b, nir_def *desc_copy_idx)
+  * update-after-bind and update-unused-while-pending are only exposed from v9. The GPU job it
+  * replaces cost about 25 us per stage per draw on the Mali-G76 (the vertex job waits on it) for
+  * a few dozen bytes; measured in Minecraft, a pass of 45 draws and 270 vertices took 3.5 ms.
+- * Returns false when a table, the copy map or a set is not CPU-visible, and the job is used.
++ * Returns false when a table, the copy map or a set is not CPU-visible, and the job is used --
++ * and for an update-after-bind set, which may still change between recording and execution, so
++ * only the job, which reads it when it runs, copies what the draw will see.
+  */
+ static bool
+ copy_desc_on_cpu(const struct panvk_shader_desc_info *desc_info,
+@@ -345,6 +347,10 @@ copy_desc_on_cpu(const struct panvk_shader_desc_info *desc_info,
+    for (uint32_t s = 0; s < ARRAY_SIZE(desc_state->sets); s++) {
+       if (desc_state->sets[s] && !desc_state->sets[s]->descs.host)
+          return false;
++      if (desc_state->sets[s] && desc_state->sets[s]->layout &&
++          (desc_state->sets[s]->layout->flags &
++           VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT))
++         return false;
+    }
+ 
+    const uint32_t *lim = ci->desc_copy.limits;
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index ac92cac..6e5dbe2 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -424,6 +424,11 @@ panvk_per_arch(get_physical_device_features)(
+       .shaderInt8 = true,
+       /* In theory, update-after-bind is supported on bifrost, but the
+        * descriptor limits would be too low for the descriptorIndexing feature.
++       * Bifrost still offers partially bound bindings, unused-while-pending
++       * updates and update-after-bind sampled images on their own: its
++       * descriptors are copied into the shader tables by a job that runs at
++       * execution time (never on the CPU for an update-after-bind set, see
++       * copy_desc_on_cpu).
+        */
+       .descriptorIndexing = PAN_ARCH >= 9,
+       .shaderInputAttachmentArrayDynamicIndexing = true,
+@@ -437,13 +442,13 @@ panvk_per_arch(get_physical_device_features)(
+       .shaderUniformTexelBufferArrayNonUniformIndexing = true,
+       .shaderStorageTexelBufferArrayNonUniformIndexing = true,
+       .descriptorBindingUniformBufferUpdateAfterBind = PAN_ARCH >= 9,
+-      .descriptorBindingSampledImageUpdateAfterBind = PAN_ARCH >= 9,
++      .descriptorBindingSampledImageUpdateAfterBind = true,
+       .descriptorBindingStorageImageUpdateAfterBind = PAN_ARCH >= 9,
+       .descriptorBindingStorageBufferUpdateAfterBind = PAN_ARCH >= 9,
+       .descriptorBindingUniformTexelBufferUpdateAfterBind = PAN_ARCH >= 9,
+       .descriptorBindingStorageTexelBufferUpdateAfterBind = PAN_ARCH >= 9,
+-      .descriptorBindingUpdateUnusedWhilePending = PAN_ARCH >= 9,
+-      .descriptorBindingPartiallyBound = PAN_ARCH >= 9,
++      .descriptorBindingUpdateUnusedWhilePending = true,
++      .descriptorBindingPartiallyBound = true,
+       .descriptorBindingVariableDescriptorCount = true,
+       .runtimeDescriptorArray = true,
+       .samplerFilterMinmax = PAN_ARCH >= 10,
+@@ -1138,10 +1143,9 @@ panvk_per_arch(get_physical_device_properties)(
+       .shaderRoundingModeRTZFloat16 = true,
+       .shaderRoundingModeRTZFloat32 = true,
+       .shaderRoundingModeRTZFloat64 = false,
+-      .maxUpdateAfterBindDescriptorsInAllPools =
+-         PAN_ARCH >= 9 ? UINT32_MAX : 0,
++      .maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX,
+       /* VK_EXT_descriptor_indexing */
+-      .maxUpdateAfterBindDescriptorsInAllPools = PAN_ARCH >= 9 ? UINT32_MAX : 0,
++      .maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX,
+       .shaderUniformBufferArrayNonUniformIndexingNative = false,
+       .shaderSampledImageArrayNonUniformIndexingNative = false,
+       .shaderStorageBufferArrayNonUniformIndexingNative = false,
+@@ -1150,35 +1154,35 @@ panvk_per_arch(get_physical_device_properties)(
+       .robustBufferAccessUpdateAfterBind = PAN_ARCH >= 9,
+       .quadDivergentImplicitLod = false,
+       .maxPerStageDescriptorUpdateAfterBindSamplers =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_SAMPLERS : 0,
++         MAX_PER_STAGE_SAMPLERS,
+       .maxPerStageDescriptorUpdateAfterBindUniformBuffers =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_UNIFORM_BUFFERS : 0,
++         MAX_PER_STAGE_UNIFORM_BUFFERS,
+       .maxPerStageDescriptorUpdateAfterBindStorageBuffers =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_STORAGE_BUFFERS : 0,
++         MAX_PER_STAGE_STORAGE_BUFFERS,
+       .maxPerStageDescriptorUpdateAfterBindSampledImages =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_SAMPLED_IMAGES : 0,
++         MAX_PER_STAGE_SAMPLED_IMAGES,
+       .maxPerStageDescriptorUpdateAfterBindStorageImages =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_STORAGE_IMAGES : 0,
++         MAX_PER_STAGE_STORAGE_IMAGES,
+       .maxPerStageDescriptorUpdateAfterBindInputAttachments =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_INPUT_ATTACHMENTS : 0,
++         MAX_PER_STAGE_INPUT_ATTACHMENTS,
+       .maxPerStageUpdateAfterBindResources =
+-         PAN_ARCH >= 9 ? MAX_PER_STAGE_RESOURCES : 0,
++         MAX_PER_STAGE_RESOURCES,
+       .maxDescriptorSetUpdateAfterBindSamplers =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_SAMPLERS : 0,
++         MAX_PER_SET_SAMPLERS,
+       .maxDescriptorSetUpdateAfterBindUniformBuffers =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_UNIFORM_BUFFERS : 0,
++         MAX_PER_SET_UNIFORM_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindUniformBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_UNIFORM_BUFFERS : 0,
++         MAX_DYNAMIC_UNIFORM_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindStorageBuffers =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_STORAGE_BUFFERS : 0,
++         MAX_PER_SET_STORAGE_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindStorageBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_STORAGE_BUFFERS : 0,
++         MAX_DYNAMIC_STORAGE_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindSampledImages =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_SAMPLED_IMAGES : 0,
++         MAX_PER_SET_SAMPLED_IMAGES,
+       .maxDescriptorSetUpdateAfterBindStorageImages =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_STORAGE_IMAGES : 0,
++         MAX_PER_SET_STORAGE_IMAGES,
+       .maxDescriptorSetUpdateAfterBindInputAttachments =
+-         PAN_ARCH >= 9 ? MAX_PER_SET_INPUT_ATTACHMENTS : 0,
++         MAX_PER_SET_INPUT_ATTACHMENTS,
+       .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT |
+                                     VK_RESOLVE_MODE_AVERAGE_BIT |
+                                     VK_RESOLVE_MODE_MIN_BIT |
+@@ -1305,11 +1309,11 @@ panvk_per_arch(get_physical_device_properties)(
+       .maxDescriptorSetTotalStorageBuffersDynamic = MAX_DYNAMIC_STORAGE_BUFFERS,
+       .maxDescriptorSetTotalBuffersDynamic = MAX_DYNAMIC_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_UNIFORM_BUFFERS : 0,
++         MAX_DYNAMIC_UNIFORM_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindTotalStorageBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_STORAGE_BUFFERS : 0,
++         MAX_DYNAMIC_STORAGE_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindTotalBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_BUFFERS : 0,
++         MAX_DYNAMIC_BUFFERS,
+ 
+       /* VK_KHR_maintenance9 */
+       /* Sparse binding not supported yet. */
+-- 
+2.43.0
+

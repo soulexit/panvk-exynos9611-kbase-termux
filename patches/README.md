@@ -196,3 +196,15 @@ Symptom:     SIGSEGV (NULL view) in CmdBeginRendering for msrtss AHB attachments
 Validation:  0 crashes over 4,291 msrtss / depth_stencil_resolve / external_memory /
              image_compression_control / device_memory_report cases (27 before)
 ```
+
+### 0018 — Descriptor indexing pieces on Bifrost (unreleased)
+
+```text
+Purpose:     offer descriptorBindingPartiallyBound, descriptorBindingUpdateUnusedWhilePending and
+             descriptorBindingSampledImageUpdateAfterBind on v6/v7; update-after-bind sets always
+             go through the execution-time descriptor copy job, never the record-time CPU copy;
+             update-after-bind limits = the regular limits
+Symptom:     the three features were reported unsupported on Mali-G72 (Valhall only)
+Validation:  dEQP-VK.descriptor_indexing 93 pass / 22 not supported / 0 fail; no regression over
+             1,000 binding_model and previously passing cases
+```
