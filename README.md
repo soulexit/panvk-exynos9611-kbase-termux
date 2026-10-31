@@ -1,5 +1,12 @@
 # PanVK for Exynos 9611 / Mali-G72 MP3 — Termux
 
+> [!IMPORTANT]
+> **This repository is archived.** The driver for Winlator, Eden, ARMSX2 and Termux now lives in
+> one repository, **[soulexit/panvk-exynos9611](https://github.com/soulexit/panvk-exynos9611)**,
+> which continues this one's history and publishes one zip per release (from 0.05). Releases here
+> stay downloadable.
+
+
 Experimental **Mesa PanVK** Vulkan driver for the **Samsung Galaxy A51 (SM-A515F, `a51`)** and other
 **Exynos 9611** devices with a **Mali-G72 MP3** GPU.
 
